@@ -1,15 +1,19 @@
 "use client";
 
-import { Suspense } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
+import { EvidenceAnalysisPanel } from "@/components/evidence-analysis-panel";
 import { ProblemCard } from "@/components/problem-card";
 import { ResultsSummary } from "@/components/results-summary";
+import { SearchResultsPanel } from "@/components/search-results-panel";
+import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { MOCK_PROBLEMS } from "@/lib/mock-data";
+import { getPipelineResult, type PipelineResult } from "@/lib/pipeline-store";
 import type { Problem, RecurrenceLevel } from "@/types";
 
 type FilterKey = "all" | RecurrenceLevel;
@@ -30,6 +34,27 @@ function ResultsPageContent() {
   const searchParams = useSearchParams();
   const query = searchParams.get("q") ?? "";
 
+  // Lazy-initialized so it's read exactly once, and safely: on a genuine
+  // page reload the store is fresh (null) on both server and client, so
+  // there's nothing to mismatch during hydration; on a normal client-side
+  // navigation from "/" (the common case — see app/page.tsx) there's no
+  // SSR pass for this transition at all, so the real value is picked up
+  // immediately. This never re-fetches /api/intent, /api/plan, or
+  // /api/search — it only reads what "/" already computed.
+  const [pipeline] = useState<PipelineResult | null>(() => getPipelineResult());
+
+  useEffect(() => {
+    if (pipeline) {
+      console.log("[ProblemRadar] Results: rendering pipeline result for query:", pipeline.query);
+      console.log("[ProblemRadar] Results: SearchRun", pipeline.searchRun);
+      console.log("[ProblemRadar] Results: EvidenceAnalysis", pipeline.analysis);
+      console.log("[ProblemRadar] Results: ProblemGeneration", pipeline.problemGeneration);
+    } else {
+      console.log("[ProblemRadar] Results: no pipeline result in this session — showing mock problems only.");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div className="mx-auto w-full max-w-[1040px] flex-1 px-6 py-10 sm:py-14">
       <Link
@@ -39,6 +64,19 @@ function ResultsPageContent() {
         <ArrowLeft className="size-3.5" />
         New exploration
       </Link>
+
+      {pipeline ? (
+        <>
+          <SearchResultsPanel plan={pipeline.plan} searchRun={pipeline.searchRun} />
+          <Separator className="my-10" />
+          <EvidenceAnalysisPanel analysis={pipeline.analysis} />
+          <Separator className="my-10" />
+          <p className="mb-3 text-sm text-muted-foreground">
+            Discovered problems below are still illustrative mock data — problem detection and ranking from
+            the evidence analysis above are a future stage.
+          </p>
+        </>
+      ) : null}
 
       <ResultsSummary problems={MOCK_PROBLEMS} query={query || undefined} />
 
