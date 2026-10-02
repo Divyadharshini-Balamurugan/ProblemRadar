@@ -1,4 +1,4 @@
-import type { EvidenceAnalysisRun, IntentScope, ResearchPlan, SearchRun } from "@/types";
+import type { CandidateProblem, EvidenceAnalysisRun, GapAnalysisResult, IntentScope, ProblemGenerationResult, ResearchPlan, SearchRun } from "@/types";
 
 interface IntentApiResponse {
   ok: boolean;
@@ -21,6 +21,12 @@ interface SearchApiResponse {
 interface AnalyzeApiResponse {
   ok: boolean;
   analysis?: EvidenceAnalysisRun;
+  error?: string;
+}
+
+interface ProblemGenerationApiResponse {
+  ok: boolean;
+  result?: ProblemGenerationResult;
   error?: string;
 }
 
@@ -128,4 +134,35 @@ export async function requestEvidenceAnalysis(plan: ResearchPlan, run: SearchRun
   }
 
   return data.analysis;
+}
+
+/** Client-side call to Gap Analysis (POST /api/analyze-gaps). */
+export async function requestGapAnalysis(problems: CandidateProblem[]): Promise<GapAnalysisResult> {
+  const response = await fetch("/api/analyze-gaps", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ problems }),
+  });
+  const data = (await response.json().catch(() => null)) as { ok: boolean; result?: GapAnalysisResult; error?: string } | null;
+  if (!response.ok || !data?.ok || !data.result) {
+    throw new Error(data?.error ?? "Gap Analysis could not process this request.");
+  }
+  return data.result;
+}
+
+/** Client-side call to Problem Generator (POST /api/generate-problems). */
+export async function requestProblemGeneration(
+  plan: ResearchPlan,
+  analysis: EvidenceAnalysisRun
+): Promise<ProblemGenerationResult> {
+  const response = await fetch("/api/generate-problems", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plan, analysis }),
+  });
+  const data = (await response.json().catch(() => null)) as ProblemGenerationApiResponse | null;
+  if (!response.ok || !data?.ok || !data.result) {
+    throw new Error(data?.error ?? "The Problem Generator could not process this request.");
+  }
+  return data.result;
 }

@@ -48,6 +48,7 @@ function ResultsPageContent() {
       console.log("[ProblemRadar] Results: rendering pipeline result for query:", pipeline.query);
       console.log("[ProblemRadar] Results: SearchRun", pipeline.searchRun);
       console.log("[ProblemRadar] Results: EvidenceAnalysis", pipeline.analysis);
+      console.log("[ProblemRadar] Results: ProblemGeneration", pipeline.problemGeneration);
     } else {
       console.log("[ProblemRadar] Results: no pipeline result in this session — showing mock problems only.");
     }

@@ -1,4 +1,4 @@
-import type { EvidenceAnalysisRun, IntentScope, ResearchPlan, SearchRun } from "@/types";
+import type { EvidenceAnalysisRun, IntentScope, ProblemGenerationResult, ResearchPlan, SearchRun } from "@/types";
 
 /**
  * Hands the completed Stage 1 → 2 → 3 → 4 pipeline result from the
@@ -21,6 +21,7 @@ export interface PipelineResult {
   plan: ResearchPlan;
   searchRun: SearchRun;
   analysis: EvidenceAnalysisRun;
+  problemGeneration: ProblemGenerationResult;
 }
 
 let latestPipelineResult: PipelineResult | null = null;

@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:problem-generator": "tsc --project tests/tsconfig.json && node --test .test-out/tests/problem-generator.test.js",
+    "test:gap-analysis": "tsc --project tests/tsconfig.json && node --test .test-out/tests/gap-analysis.test.js",
+    "test": "tsc --project tests/tsconfig.json && node --test .test-out/tests/problem-generator.test.js .test-out/tests/gap-analysis.test.js"
   },
   "dependencies": {
     "@radix-ui/react-progress": "^1.1.16",

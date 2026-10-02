@@ -7,7 +7,7 @@ import { Loader2, Radar } from "lucide-react";
 import { ExplorationInput } from "@/components/exploration-input";
 import { QuickStartOptions } from "@/components/quick-start-options";
 import { Badge } from "@/components/ui/badge";
-import { requestEvidenceAnalysis, requestIntentScope, requestResearchPlan, requestSearchRun } from "@/lib/api-client";
+import { requestEvidenceAnalysis, requestIntentScope, requestProblemGeneration, requestResearchPlan, requestSearchRun } from "@/lib/api-client";
 import { setPipelineResult } from "@/lib/pipeline-store";
 import type { ExplorationChip, ExplorationContext, QuickStartOption } from "@/types";
 
@@ -96,10 +96,17 @@ export default function Home() {
       const analysis = await requestEvidenceAnalysis(plan, searchRun);
       console.log("[ProblemRadar] Analyze: result", analysis);
 
+      // Stage 5: synthesize candidate problems from the exact evidence
+      // analysis above; this stage never searches or re-analyzes sources.
+      setStatusMessage("Generating evidence-grounded problems…");
+      console.log("[ProblemRadar] Problem Generator: requesting candidates from EvidenceAnalysis");
+      const problemGeneration = await requestProblemGeneration(plan, analysis);
+      console.log("[ProblemRadar] Problem Generator: result", problemGeneration);
+
       // Stage 5: hand everything off to the results page/state — no
       // route reads this back over the network, it's the same completed
       // pipeline result, just passed along for /results to render.
-      setPipelineResult({ query, intent, plan, searchRun, analysis });
+      setPipelineResult({ query, intent, plan, searchRun, analysis, problemGeneration });
       console.log("[ProblemRadar] Results: pipeline complete, navigating to /results via /research");
 
       router.push(`/research?q=${encodeURIComponent(query)}`);
