@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import type { ResearchPlan, SearchRun } from "@/types";
-import { RESEARCH_LENSES } from "@/types";
+import { DISCOVERY_ANGLES, RESEARCH_LENSES } from "@/types";
 import { LLMConnectionError } from "@/lib/llm";
 import { runEvidenceAnalyzer } from "@/lib/llm/evidence-analyzer";
 
@@ -34,6 +34,7 @@ import { runEvidenceAnalyzer } from "@/lib/llm/evidence-analyzer";
 const HypothesisRequestSchema = z.object({
   id: z.string().min(1),
   lens: z.enum(RESEARCH_LENSES),
+  angle: z.enum(DISCOVERY_ANGLES),
   hypothesis: z.string().min(1),
   evidence_targets: z.array(z.string()).default([]),
   source_strategies: z.array(z.string()).default([]),

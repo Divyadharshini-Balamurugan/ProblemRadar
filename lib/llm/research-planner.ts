@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import type { IntentScope, ResearchHypothesis, ResearchPlan, SearchBudget } from "@/types";
-import { RESEARCH_LENSES } from "@/types";
+import { DISCOVERY_ANGLES, RESEARCH_LENSES } from "@/types";
 import { extractJsonObject } from "./json-utils";
 import { getLLMProvider } from "./index";
 import { withRetry } from "./with-retry";
@@ -81,6 +81,7 @@ const LENS_GUIDANCE = `"lens" is the TYPE of problem — the mechanism by which 
 const HypothesisSchema = z.object({
   id: z.string().min(1),
   lens: z.enum(RESEARCH_LENSES),
+  angle: z.enum(DISCOVERY_ANGLES),
   hypothesis: z.string().min(30).max(220),
   evidence_targets: z.array(z.string().min(1).max(80)).min(2).max(3),
   source_strategies: z.array(z.string().min(1).max(80)).min(2).max(3),
@@ -99,11 +100,13 @@ const PlannerOutputSchema = z.object({
   hypotheses: z.array(HypothesisSchema).min(MIN_HYPOTHESES).max(MAX_HYPOTHESES),
 });
 
+const ANGLE_GUIDANCE = `"angle" selects HOW to investigate, distinct from "lens" (the problem type): "friction" (barriers, delays, difficulty, access problems), "workflow" (what people try to do and where the process breaks), "workaround" (informal/manual alternatives used instead), "complaints" (reviews, complaints, negative public feedback), "research" (academic studies/surveys/systematic reviews), "institutional_evidence" (government reports, audits, datasets), "existing_solution_failure" (limitations of current services/products), "contradiction" (a service exists yet difficulty remains). Pick the subset relevant to this scope; do not emit all eight.`;
+
 // Deliberately terse: this is a system prompt for a small, CPU-bound
 // local model, and prompt/output brevity is the main latency lever.
 // "Output ONLY JSON" is stated up front and repeated at the end of the
 // user prompt, since some models attend to the trailing instruction most.
-const SYSTEM_PROMPT = `You are the Research Planner inside ProblemRadar. You receive a validated Intent/Scope JSON object and turn it into a small, diverse set of concrete, falsifiable research hypotheses (each on one distinct "lens"), each with public evidence targets, public source types, and candidate search queries. You do not run any search or judge whether the problem is real — only plan what to investigate and how. Output ONLY the JSON object: no prose, no markdown fences, no <think> reasoning, no explanation.`;
+const SYSTEM_PROMPT = `You are the Research Planner inside ProblemRadar. You receive a validated Intent/Scope JSON object and turn it into a small, diverse set of investigation questions (each on one distinct "lens" and one distinct discovery "angle"), each with public evidence targets, public source types, and candidate search queries. You do not run any search or judge whether a problem is real — only plan what to investigate and how. The "hypothesis" field MUST be an open investigation question ("What...?", "How...?", "Where...?"), never a statement that already asserts the problem, its affected group, or its cause. Output ONLY the JSON object: no prose, no markdown fences, no <think> reasoning, no explanation.`;
 
 function buildPrompt(intent: IntentScope): string {
   const locationRule = intent.location
@@ -129,16 +132,23 @@ ${LENS_CATALOG}
 
 ${LENS_GUIDANCE}
 
-Produce ${MIN_HYPOTHESES}-${MAX_HYPOTHESES} hypotheses. Rules:
-1. Each hypothesis: one concrete, falsifiable, specific claim — no vague words like "inefficiencies" or "gaps"; name the actual mechanism/process/group. Time-bound to time_scope.
-2. "lens": exactly one identifier from the Lenses list above, verbatim — the TYPE of problem, never the domain/topic/technology/infrastructure (see guidance above).
-3. "id": short unique string ("h1", "h2", ...).
-4. "evidence_targets" (2-3): PUBLIC evidence only — recent news, gov/municipal reports, official announcements, tenders, RTI disclosures, citizen complaints, open datasets, surveys, reviews. Never internal-only records.
-5. "source_strategies" (2-3): realistic public source types (not real URLs).
-6. ${queryRule}
+Discovery angles (choose only those relevant to this scope; prefer distinct angles across hypotheses):
+"${DISCOVERY_ANGLES.join('", "')}"
+
+${ANGLE_GUIDANCE}
+
+Produce ${MIN_HYPOTHESES}-${MAX_HYPOTHESES} investigations. Rules:
+1. The "hypothesis" field is an INVESTIGATION QUESTION that defines what to find out — it must NOT assert that the problem exists, that a causal mechanism is real, or that a solution is inadequate. Frame it as "What...?", "How...?", "Where...?", "Which factors...?". Time-bound to time_scope and specific to the scope's domain, audience, and location.
+2. "lens": exactly one identifier from the Lenses list, verbatim — the TYPE of problem.
+3. "angle": exactly one identifier from the discovery angles above — the specific investigative angle to explore (never invent a new value).
+4. "id": short unique string ("h1", "h2", ...).
+5. "evidence_targets" (2-3): PUBLIC evidence only — recent news, gov/municipal reports, official announcements, tenders, RTI disclosures, citizen complaints, open datasets, surveys, reviews. Never internal-only records.
+6. "source_strategies" (2-3): realistic public source types (not real URLs).
+7. ${queryRule}
+8. Queries for a given "angle" must probe that angle: friction → barriers/delay/access problems; workflow → the concrete activity/process and its breaking points; workaround → informal/manual alternatives used in practice; complaints → reviews/complaints/negative feedback; research → studies/surveys/systematic reviews; institutional_evidence → government reports/audits/datasets; existing_solution_failure → documented limitations of current services; contradiction → cases where the solution exists but the difficulty persists. A hypothesis's queries should not be interchangeable with another hypothesis's queries merely by duplicating its wording.
 
 Output ONLY this JSON shape, nothing else:
-{"hypotheses":[{"id":"h1","lens":"<lens>","hypothesis":"...","evidence_targets":["...","..."],"source_strategies":["...","..."],"search_queries":["...","..."]}]}`;
+{"hypotheses":[{"id":"h1","lens":"<lens>","angle":"<angle>","hypothesis":"...","evidence_targets":["...","..."],"source_strategies":["...","..."],"search_queries":["...","..."]}]}`;
 }
 
 function normalizeForComparison(text: string): Set<string> {
@@ -171,6 +181,7 @@ const NEAR_DUPLICATE_THRESHOLD = 0.6;
 const KNOWN_HYPOTHESIS_KEYS = new Set([
   "id",
   "lens",
+  "angle",
   "hypothesis",
   "evidence_targets",
   "source_strategies",
@@ -338,6 +349,17 @@ function assertHypothesesAreSound(hypotheses: ResearchHypothesis[], raw: string)
       );
     }
     seenLenses.add(h.lens);
+
+    // The "hypothesis" must read as an open investigation question, not a
+    // statement of an assumed problem.
+    const statement = h.hypothesis.trim();
+    const startsAsQuestion = /^(what|how|where|when|why|which|who|in what|to what|does|do|are|is|can)\b/i.test(statement);
+    if (!statement.endsWith("?") && !startsAsQuestion) {
+      throw new ResearchPlanParseError(
+        `Hypothesis "${h.hypothesis}" reads as a statement, not an investigation question.`,
+        raw
+      );
+    }
 
     for (const query of h.search_queries) {
       const normalized = query.trim().toLowerCase();
@@ -632,16 +654,22 @@ function assertSearchQueriesAreCurrent(
  * deterministic means it's always internally consistent and never a
  * source of validation failure.
  */
-function computeSearchBudget(intent: IntentScope, hypothesisCount: number): SearchBudget {
-  // `breadth` is free text from stage 1 (not a strict enum), so match
-  // loosely rather than assuming an exact value.
-  const breadth = intent.breadth.trim().toLowerCase();
-  const perHypothesisQueries = breadth.includes("narrow") ? 3 : breadth.includes("broad") ? 5 : 4; // exploratory / anything else
+function computeSearchBudget(
+  intent: IntentScope,
+  hypothesisCount: number
+): SearchBudget {
+  const maxQueriesPerHypothesis = 1;
+  const maxSourcesPerHypothesis = 3;
+
+  const totalQueryBudget = Math.min(
+    maxQueriesPerHypothesis * hypothesisCount,
+    6
+  );
 
   return {
-    max_queries_per_hypothesis: perHypothesisQueries,
-    max_sources_per_hypothesis: 5,
-    total_query_budget: perHypothesisQueries * hypothesisCount,
+    max_queries_per_hypothesis: maxQueriesPerHypothesis,
+    max_sources_per_hypothesis: maxSourcesPerHypothesis,
+    total_query_budget: totalQueryBudget,
   };
 }
 

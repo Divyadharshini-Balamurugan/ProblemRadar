@@ -7,8 +7,9 @@ import type {
   SearchResult,
   SearchRun,
 } from "@/types";
+import { mapWithConcurrency } from "../llm/problem-generator";
 import { SERPAPI_CONFIG } from "./config";
-import { SerpApiError, searchSerpApi } from "./serpapi-client";
+import { SerpApiError, searchSerpApi, type RawSearchItem } from "./serpapi-client";
 
 /**
  * Queries this similar (word-overlap) are treated as near-duplicates and
@@ -89,12 +90,17 @@ function skip(
  * that call is wrapped in its own try/catch, so one bad/slow/rate-limited
  * query never aborts the rest of the run.
  *
- * Searches run strictly sequentially (with a small politeness delay
- * between calls) — deliberate for this first implementation, to stay
- * clear of rate limits; concurrency can be revisited once correctness is
- * verified.
+ * Independent queries execute with bounded concurrency (SEARCH_CONCURRENCY,
+ * default 4) using the shared `mapWithConcurrency` pool — one slow or
+ * failing query never blocks independent ones. Planning is deterministic:
+ * the same budget/dedup checks run up front (in hypothesis/query order), so
+ * executions/results are merged back in that order — provenance, budget
+ * accounting, and ordering are identical to the strictly-sequential design.
  */
-export async function runSearchOrchestrator(plan: ResearchPlan): Promise<SearchRun> {
+export async function runSearchOrchestrator(
+  plan: ResearchPlan,
+  options?: { searchFn?: typeof searchSerpApi; concurrency?: number }
+): Promise<SearchRun> {
   const startedAt = new Date();
   const { max_queries_per_hypothesis, max_sources_per_hypothesis, total_query_budget } = plan.search_budget;
 
@@ -115,44 +121,31 @@ export async function runSearchOrchestrator(plan: ResearchPlan): Promise<SearchR
   let queriesSkippedDuplicate = 0;
   let queriesSkippedBudget = 0;
 
+  /** Planning slots keep skipped-vs-runnable entries in the exact plan order so merging is deterministic. */
+  interface ExecSlot {
+    kind: "skip" | "run";
+    hypothesis: ResearchHypothesis;
+    query: string;
+    skipStatus?: SearchExecutionStatus;
+    skipReason?: string;
+  }
+  const slots: ExecSlot[] = [];
+
   for (const hypothesis of plan.hypotheses) {
     sourcesReturnedPerHypothesis[hypothesis.id] = 0;
     let queriesForThisHypothesis = 0;
 
     for (const query of hypothesis.search_queries) {
-      // 1. Per-hypothesis source cap already met — running more queries here can't add anything useful.
-      if (sourcesReturnedPerHypothesis[hypothesis.id] >= max_sources_per_hypothesis) {
-        executions.push(
-          skip(
-            hypothesis,
-            query,
-            "skipped_budget_exhausted",
-            `hypothesis "${hypothesis.id}" already has ${sourcesReturnedPerHypothesis[hypothesis.id]} source(s) (max_sources_per_hypothesis=${max_sources_per_hypothesis})`
-          )
-        );
-        queriesSkippedBudget += 1;
-        continue;
-      }
-
       // 2. Per-hypothesis query cap.
       if (queriesForThisHypothesis >= max_queries_per_hypothesis) {
-        executions.push(
-          skip(
-            hypothesis,
-            query,
-            "skipped_budget_exhausted",
-            `hypothesis "${hypothesis.id}" already ran ${queriesForThisHypothesis} quer(y/ies) (max_queries_per_hypothesis=${max_queries_per_hypothesis})`
-          )
-        );
+        slots.push({ kind: "skip", hypothesis, query, skipStatus: "skipped_budget_exhausted", skipReason: `hypothesis "${hypothesis.id}" already ran ${queriesForThisHypothesis} quer(y/ies) (max_queries_per_hypothesis=${max_queries_per_hypothesis})` });
         queriesSkippedBudget += 1;
         continue;
       }
 
       // 3. Global query budget across the whole plan.
       if (queriesExecuted >= total_query_budget) {
-        executions.push(
-          skip(hypothesis, query, "skipped_budget_exhausted", `total_query_budget (${total_query_budget}) already reached`)
-        );
+        slots.push({ kind: "skip", hypothesis, query, skipStatus: "skipped_budget_exhausted", skipReason: `total_query_budget (${total_query_budget}) already reached` });
         queriesSkippedBudget += 1;
         continue;
       }
@@ -160,7 +153,7 @@ export async function runSearchOrchestrator(plan: ResearchPlan): Promise<SearchR
       // 4. Dedup — exact match first (cheap), then near-duplicate word-overlap, both across the *whole* plan, not just this hypothesis.
       const normalized = query.trim().toLowerCase();
       if (seenExactQueries.has(normalized)) {
-        executions.push(skip(hypothesis, query, "skipped_duplicate_query", "identical to an earlier query in this plan"));
+        slots.push({ kind: "skip", hypothesis, query, skipStatus: "skipped_duplicate_query", skipReason: "identical to an earlier query in this plan" });
         queriesSkippedDuplicate += 1;
         continue;
       }
@@ -168,83 +161,113 @@ export async function runSearchOrchestrator(plan: ResearchPlan): Promise<SearchR
         (prior) => querySimilarity(prior, query) >= NEAR_DUPLICATE_QUERY_THRESHOLD
       );
       if (nearDuplicateOf) {
-        executions.push(
-          skip(hypothesis, query, "skipped_duplicate_query", `near-duplicate of an earlier query ("${nearDuplicateOf}")`)
-        );
+        slots.push({ kind: "skip", hypothesis, query, skipStatus: "skipped_duplicate_query", skipReason: `near-duplicate of an earlier query ("${nearDuplicateOf}")` });
         queriesSkippedDuplicate += 1;
         continue;
       }
 
-      // Reserve this query's slot before calling out, so a slow/erroring call can't be double-counted against the budget by anything re-entrant.
       seenExactQueries.add(normalized);
       acceptedQueryTexts.push(query);
       queriesForThisHypothesis += 1;
       queriesExecuted += 1;
-
-      const executionStartedAt = Date.now();
-      try {
-        console.log(`[ProblemRadar/SearchOrchestrator] → hypothesis="${hypothesis.id}" query="${query}"`);
-        const rawItems = await searchSerpApi(query, { numResults: SERPAPI_CONFIG.resultsPerQuery });
-        const latencyMs = Date.now() - executionStartedAt;
-
-        let keptCount = 0;
-        for (const item of rawItems) {
-          if (sourcesReturnedPerHypothesis[hypothesis.id] >= max_sources_per_hypothesis) break;
-
-          const canonical = canonicalizeUrl(item.link);
-          if (seenCanonicalUrls.has(canonical)) continue; // same source already returned elsewhere in this run
-          seenCanonicalUrls.add(canonical);
-
-          results.push({
-            hypothesis_id: hypothesis.id,
-            query,
-            title: item.title,
-            url: item.link,
-            snippet: item.snippet,
-            source: item.source,
-            position: item.position,
-            published_date: item.date,
-          });
-          sourcesReturnedPerHypothesis[hypothesis.id] += 1;
-          keptCount += 1;
-        }
-
-        executions.push({
-          hypothesis_id: hypothesis.id,
-          query,
-          status: "success",
-          result_count: keptCount,
-          latency_ms: latencyMs,
-        });
-        console.log(
-          `[ProblemRadar/SearchOrchestrator] ✓ hypothesis="${hypothesis.id}" query="${query}" — ${rawItems.length} raw result(s), ${keptCount} kept after dedup, ${latencyMs}ms`
-        );
-      } catch (error) {
-        const latencyMs = Date.now() - executionStartedAt;
-        const message =
-          error instanceof SerpApiError
-            ? `[${error.kind}] ${error.message}`
-            : error instanceof Error
-              ? error.message
-              : String(error);
-
-        executions.push({
-          hypothesis_id: hypothesis.id,
-          query,
-          status: "error",
-          result_count: 0,
-          error: message,
-          latency_ms: latencyMs,
-        });
-        console.warn(
-          `[ProblemRadar/SearchOrchestrator] ✗ hypothesis="${hypothesis.id}" query="${query}" failed after ${latencyMs}ms: ${message}`
-        );
-      }
-
-      if (SERPAPI_CONFIG.delayBetweenQueriesMs > 0) {
-        await sleep(SERPAPI_CONFIG.delayBetweenQueriesMs);
-      }
+      slots.push({ kind: "run", hypothesis, query });
     }
+  }
+
+  // Execute the "run" queries with bounded concurrency; the shared
+  // `mapWithConcurrency` pool is reused from the Problem Generator. One
+  // timed-out/erroring query becomes an isolated error execution, never a
+  // broken run.
+  const concurrency = Math.max(1, options?.concurrency ?? (Number.parseInt(process.env.SEARCH_CONCURRENCY ?? "4", 10) || 4));
+  const searchFn = options?.searchFn ?? searchSerpApi;
+  console.log(`[ProblemRadar/SearchOrchestrator] executing ${queriesExecuted} quer(y/ies) with bounded concurrency=${concurrency}`);
+
+  interface TaskOutcome {
+    slot: ExecSlot;
+    status: SearchExecutionStatus;
+    result_count: number;
+    error?: string;
+    latency_ms: number;
+    rawItems: RawSearchItem[];
+  }
+
+  const outcomesBySlot = new Map<ExecSlot, TaskOutcome>();
+  await mapWithConcurrency(slots, concurrency, async (slot) => {
+    if (slot.kind !== "run") return;
+    const startedAt = Date.now();
+    try {
+      console.log(`[ProblemRadar/SearchOrchestrator] → hypothesis="${slot.hypothesis.id}" query="${slot.query}"`);
+      const rawItems = await searchFn(slot.query, { numResults: SERPAPI_CONFIG.resultsPerQuery });
+      outcomesBySlot.set(slot, {
+        slot,
+        status: "success",
+        result_count: rawItems.length,
+        latency_ms: Date.now() - startedAt,
+        rawItems,
+      });
+    } catch (error) {
+      const message =
+        error instanceof SerpApiError
+          ? `[${error.kind}] ${error.message}`
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      console.warn(`[ProblemRadar/SearchOrchestrator] ✗ hypothesis="${slot.hypothesis.id}" query="${slot.query}" failed after ${Date.now() - startedAt}ms: ${message}`);
+      outcomesBySlot.set(slot, { slot, status: "error", result_count: 0, error: message, latency_ms: Date.now() - startedAt, rawItems: [] });
+    }
+  });
+
+  // Deterministic merge — in plan order: executions and results appended in
+  // slot order, with the same per-hypothesis source cap and global URL dedup
+  // applied at merge time (this preserves determinism and budget accounting
+  // while the HTTP calls run concurrently).
+  for (const slot of slots) {
+    if (slot.kind === "skip") {
+      executions.push(skip(slot.hypothesis, slot.query, slot.skipStatus ?? "skipped_budget_exhausted", slot.skipReason ?? ""));
+      continue;
+    }
+    const outcome = outcomesBySlot.get(slot)!;
+    if (outcome.status === "error") {
+      executions.push({
+        hypothesis_id: slot.hypothesis.id,
+        query: slot.query,
+        status: "error",
+        result_count: 0,
+        error: outcome.error,
+        latency_ms: outcome.latency_ms,
+      });
+      continue;
+    }
+
+    let keptCount = 0;
+    for (const item of outcome.rawItems) {
+      if (sourcesReturnedPerHypothesis[slot.hypothesis.id] >= max_sources_per_hypothesis) break;
+      const canonical = canonicalizeUrl(item.link);
+      if (seenCanonicalUrls.has(canonical)) continue;
+      seenCanonicalUrls.add(canonical);
+      results.push({
+        hypothesis_id: slot.hypothesis.id,
+        query: slot.query,
+        title: item.title,
+        url: item.link,
+        snippet: item.snippet,
+        source: item.source,
+        position: item.position,
+        published_date: item.date,
+      });
+      sourcesReturnedPerHypothesis[slot.hypothesis.id] += 1;
+      keptCount += 1;
+    }
+    executions.push({
+      hypothesis_id: slot.hypothesis.id,
+      query: slot.query,
+      status: "success",
+      result_count: keptCount,
+      latency_ms: outcome.latency_ms,
+    });
+    console.log(
+      `[ProblemRadar/SearchOrchestrator] ✓ hypothesis="${slot.hypothesis.id}" query="${slot.query}" — ${outcome.rawItems.length} raw result(s), ${keptCount} kept after dedup, ${outcome.latency_ms}ms`
+    );
   }
 
   const completedAt = new Date();

@@ -195,3 +195,151 @@ test("independent candidates execute with bounded concurrency", async () => {
   await runGapAnalysis(problems, { getProvider: provider, search: searchReturning([item()]), concurrency: 3 });
   assert.ok(maxInFlight > 1, `expected concurrency, maxInFlight=${maxInFlight}`);
 });
+
+// ── Phase 4: evidence-first gap analysis ──────────────────────
+
+/** The Phase 3 shape: a candidate carrying its validated observations and own evidence provenance. */
+const problemWithObservations: CandidateProblem = {
+  ...problem,
+  observations: [{ claim: "Rural residents lack coverage from fixed terrestrial broadband", evidence_indices: [1] }],
+};
+
+test("the analysis prompt is anchored on the candidate's observations and provenance", async () => {
+  let prompt = "";
+  const provider = (): LLMProvider => ({
+    name: "test",
+    async generateJSON(params) {
+      prompt = params.prompt;
+      return JSON.stringify(groundedOutput);
+    },
+  });
+  await runGapAnalysis([problemWithObservations], { getProvider: provider, search: searchReturning([item()]) });
+  // Evidence-first: the validated observations behind the candidate...
+  assert.match(prompt, /Validated observations behind the candidate/);
+  assert.ok(prompt.includes("Rural residents lack coverage from fixed terrestrial broadband"));
+  // ...and the candidate's own evidence provenance (what the problem IS).
+  assert.match(prompt, /original evidence provenance/);
+  assert.ok(prompt.includes("h1:e1"));
+  assert.ok(prompt.includes("https://example.org/original"));
+  // The hypothesis is never part of the evidence.
+  assert.match(prompt, /the research hypothesis behind it is not supplied and is never evidence/);
+});
+
+test("queries anchor on the validated observation's friction, not broad topics", () => {
+  const queries = buildGapQueries(problemWithObservations);
+  assert.ok(queries.length > 0 && queries.length <= 5);
+  // The observation itself leads the search...
+  assert.ok(queries[0].includes("fixed terrestrial broadband"));
+  // ...followed by the candidate's own statement/population/activity.
+  assert.ok(queries.some((query) => query.includes("telehealth")));
+  assert.ok(queries.some((query) => query.toLowerCase().includes("rural")));
+});
+
+test("every solution claim traces to its cited search evidence", async () => {
+  const calls: string[] = [];
+  const result = await runGapAnalysis([problem], { getProvider: providerReturning(groundedOutput), search: searchReturning([item()], calls) });
+  const solution = result.analyses[0].existing_solutions[0];
+  assert.equal(solution.evidence_refs.length, 1);
+  const ref = solution.evidence_refs[0];
+  assert.equal(ref.candidate_problem_id, "h1-p1");
+  assert.equal(ref.solution_evidence_id, "h1-p1:s1");
+  assert.equal(ref.url, "https://example.org/telehealth-program");
+  assert.equal(ref.query, calls[0]);
+  assert.ok(ref.query.includes("telehealth"));
+  assert.equal(ref.title, "Rural telehealth program expands access");
+  assert.equal(ref.source, "Example News");
+  assert.equal(ref.evidence_summary, "A nonprofit runs telehealth kiosks in rural clinics, but coverage remains limited to a few counties.");
+});
+
+test('unsupported "solution failure" claim is rejected', async () => {
+  // The cited evidence describes a working, expanding program — no
+  // failure, limitation, or gap is stated anywhere in it.
+  const items = [item({ title: "Rural telehealth kiosk program", snippet: "The rural telehealth kiosk program runs clinics and expands services every year." })];
+  const output = {
+    ...groundedOutput,
+    unresolved_gaps: [{ gap: "Kiosk program fails rural patients", explanation: "The rural telehealth kiosk program fails to serve rural clinics.", evidence_indices: [1] }],
+  };
+  const result = await runGapAnalysis([problem], { getProvider: providerReturning(output), search: searchReturning(items) });
+  assert.equal(result.analyses[0].status, "failed");
+  assert.equal(result.analyses[0].unresolved_gaps.length, 0);
+});
+
+test('a documented limitation supports a "fails to cover" gap claim', async () => {
+  // The evidence states the limitation itself, so the failure claim is grounded.
+  const items = [item({ title: "Rural telehealth kiosk program", snippet: "The rural telehealth kiosk program runs clinics, but coverage remains limited to a few counties." })];
+  const output = {
+    ...groundedOutput,
+    unresolved_gaps: [{ gap: "Kiosk coverage fails to reach most rural counties", explanation: "The rural telehealth kiosk program fails to cover most rural counties because coverage remains limited.", evidence_indices: [1] }],
+  };
+  const result = await runGapAnalysis([problem], { getProvider: providerReturning(output), search: searchReturning(items) });
+  assert.equal(result.analyses[0].status, "analyzed");
+  assert.equal(result.analyses[0].unresolved_gaps.length, 1);
+});
+
+test("documented partial coverage yields a partial-coverage gap with provenance", async () => {
+  const result = await runGapAnalysis([problem], { getProvider: providerReturning(groundedOutput), search: searchReturning([item()]) });
+  const analysis = result.analyses[0];
+  assert.equal(analysis.solution_coverage, "partial");
+  const gap = analysis.unresolved_gaps[0];
+  assert.match(gap.gap, /coverage/i);
+  assert.equal(gap.evidence_refs.length, 1);
+  assert.equal(gap.evidence_refs[0].url, "https://example.org/telehealth-program");
+  assert.equal(gap.evidence_refs[0].solution_evidence_id, "h1-p1:s1");
+});
+
+test("invented partial-coverage claim is rejected", async () => {
+  // "Only wealthy urban counties" is a coverage distinction the
+  // cited evidence never states — it shares enough vocabulary to
+  // pass the semantic check, so the invention budget is what
+  // rejects it.
+  const output = {
+    ...groundedOutput,
+    unresolved_gaps: [{ gap: "Urban-only rollout", explanation: "The kiosk program rolled out only in wealthy urban counties and deliberately excludes rural clinics entirely.", evidence_indices: [1] }],
+  };
+  const result = await runGapAnalysis([problem], { getProvider: providerReturning(output), search: searchReturning([item()]) });
+  assert.equal(result.analyses[0].status, "failed");
+  assert.equal(result.analyses[0].unresolved_gaps.length, 0);
+});
+
+test("a candidate may legitimately end with no unresolved gap", async () => {
+  const output = { ...groundedOutput, unresolved_gaps: [], solution_coverage: "clear" as const };
+  const result = await runGapAnalysis([problem], { getProvider: providerReturning(output), search: searchReturning([item()]) });
+  const analysis = result.analyses[0];
+  assert.equal(analysis.status, "analyzed");
+  assert.equal(analysis.existing_solutions.length, 1);
+  assert.equal(analysis.unresolved_gaps.length, 0);
+  assert.equal(analysis.solution_coverage, "clear");
+});
+
+test("search failures leave the candidate insufficient_evidence, not failed", async () => {
+  const result = await runGapAnalysis([problem], {
+    getProvider: providerReturning(groundedOutput),
+    search: async () => {
+      throw new Error("SerpApi unavailable");
+    },
+  });
+  const analysis = result.analyses[0];
+  assert.equal(analysis.status, "insufficient_evidence");
+  assert.equal(analysis.solution_coverage, "insufficient_solution_evidence");
+  assert.equal(analysis.existing_solutions.length, 0);
+  assert.equal(analysis.unresolved_gaps.length, 0);
+  assert.ok(analysis.error?.includes("SerpApi unavailable"));
+});
+
+test("candidate and source provenance is preserved through the analysis", async () => {
+  const calls: string[] = [];
+  const result = await runGapAnalysis([problem], { getProvider: providerReturning(groundedOutput), search: searchReturning([item()], calls) });
+  const analysis = result.analyses[0];
+  // Copied verbatim from the candidate — never rewritten by this stage.
+  assert.equal(analysis.problem_statement, problem.problem_statement);
+  assert.equal(analysis.candidate_problem_id, problem.id);
+  assert.equal(analysis.id, `${problem.id}-g1`);
+  const ref = analysis.evidence_refs[0];
+  assert.equal(ref.solution_evidence_id, "h1-p1:s1");
+  assert.equal(ref.candidate_problem_id, problem.id);
+  assert.equal(ref.url, item().link);
+  assert.equal(ref.query, calls[0]);
+  assert.equal(ref.title, item().title);
+  assert.equal(ref.source, item().source);
+  assert.equal(ref.evidence_summary, item().snippet);
+});

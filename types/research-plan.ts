@@ -32,11 +32,36 @@ export const RESEARCH_LENSES = [
 
 export type ResearchLens = (typeof RESEARCH_LENSES)[number];
 
+/**
+ * Canonical discovery angles (stage 2 investigation framing). The planner
+ * picks the relevant subset for the given scope — it does NOT force all
+ * eight on every request. `lens` describes the *problem type* (kept as-is
+ * downstream); `angle` describes *how we investigate* it.
+ */
+export const DISCOVERY_ANGLES = [
+  "friction",
+  "workflow",
+  "workaround",
+  "complaints",
+  "research",
+  "institutional_evidence",
+  "existing_solution_failure",
+  "contradiction",
+] as const;
+
+export type DiscoveryAngle = (typeof DISCOVERY_ANGLES)[number];
+
 export interface ResearchHypothesis {
   /** Short, unique identifier within the plan (e.g. "h1"). */
   id: string;
   lens: ResearchLens;
-  /** A single, concrete, falsifiable statement of the suspected problem. */
+  /** Which discovery angle this investigation explores. */
+  angle: DiscoveryAngle;
+  /**
+   * An investigation QUESTION about what is happening in the domain — not
+   * a statement that the problem is real. E.g. "What barriers affect rural
+   * residents while accessing healthcare services?"
+   */
   hypothesis: string;
   /**
    * What evidence, if found, would confirm or refute this hypothesis —

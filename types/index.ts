@@ -7,3 +7,4 @@ export * from "./search";
 export * from "./evidence";
 export * from "./problem-generation";
 export * from "./gap-analysis";
+export * from "./problem-ranking";
