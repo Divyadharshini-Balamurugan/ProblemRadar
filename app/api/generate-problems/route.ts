@@ -2,13 +2,14 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import type { EvidenceAnalysisRun, ResearchPlan } from "@/types";
-import { EVIDENCE_RECENCY_LEVELS, EVIDENCE_RELEVANCE_LEVELS, EVIDENCE_STANCES, RESEARCH_LENSES } from "@/types";
+import { DISCOVERY_ANGLES, EVIDENCE_RECENCY_LEVELS, EVIDENCE_RELEVANCE_LEVELS, EVIDENCE_STANCES, RESEARCH_LENSES } from "@/types";
 import { LLMConnectionError } from "@/lib/llm";
 import { runProblemGenerator } from "@/lib/llm/problem-generator";
 
 const HypothesisSchema = z.object({
   id: z.string().min(1),
   lens: z.enum(RESEARCH_LENSES),
+  angle: z.enum(DISCOVERY_ANGLES),
   hypothesis: z.string().min(1),
   evidence_targets: z.array(z.string()).default([]),
   source_strategies: z.array(z.string()).default([]),
@@ -23,6 +24,16 @@ const PlanSchema = z.object({
   }),
 }) satisfies z.ZodType<ResearchPlan>;
 
+const EvidenceObservationSchema = z.object({
+  observation: z.string().min(1),
+  affected_group: z.string().nullable(),
+  activity: z.string().nullable(),
+  friction: z.string().nullable(),
+  workaround: z.string().nullable(),
+  existing_solution: z.string().nullable(),
+  unresolved_signal: z.string().nullable(),
+  source_index: z.number().int().positive(),
+});
 const EvidenceSchema = z.object({
   hypothesis_id: z.string().min(1),
   url: z.string().min(1),
@@ -33,6 +44,10 @@ const EvidenceSchema = z.object({
   relevance: z.enum(EVIDENCE_RELEVANCE_LEVELS),
   recency: z.enum(EVIDENCE_RECENCY_LEVELS),
   evidence_summary: z.string().min(1),
+  // Validated Phase 2 observations — the Problem Generator derives candidates
+  // from these, so they must survive request validation (zod strips keys a
+  // schema doesn't declare).
+  observations: z.array(EvidenceObservationSchema).optional(),
 });
 const AnalysisSchema = z.object({
   started_at: z.string(),

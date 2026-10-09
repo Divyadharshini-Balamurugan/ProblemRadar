@@ -1,225 +1,100 @@
-# UI Architecture
+# UI and Pipeline Architecture
 
-This document explains how the three pages fit together, what each
-component is responsible for, and how data flows between them today.
-The workspace → `/api/intent` → `/api/plan` → `/api/search` →
-`/api/analyze` chain is real and now runs automatically, end-to-end,
-from one submit on `/`; only `/results`'s `ProblemCard` list past the
-Search Evidence and Evidence Analysis panels is still mock, client-side
-data.
+This document describes the current page flow and how UI state connects to the server pipeline. The workspace runs five stages before showing the progress screen. Gap Analysis is implemented as a standalone capability but is not part of this page flow yet.
 
-## Page flow
+## Main page flow
 
+```text
+Browser: / (app/page.tsx)
+  ├─ POST /api/intent              → IntentScope
+  ├─ POST /api/plan                → ResearchPlan
+  ├─ POST /api/search              → SearchRun
+  ├─ POST /api/analyze             → EvidenceAnalysisRun
+  ├─ POST /api/generate-problems   → ProblemGenerationResult
+  │
+  ├─ setPipelineResult({...})      → browser module memory
+  └─ navigate to /research?q=...
+       └─ timed progress UI
+            └─ /results?q=...
+                 ├─ SearchResultsPanel (real search output)
+                 ├─ EvidenceAnalysisPanel (real analysis output)
+                 └─ ResultsSummary + ProblemCard (MOCK_PROBLEMS)
 ```
- /                       /api/intent (real)      /api/plan (real)        /api/search (real)       /api/analyze (real)      /research?q=...           /results?q=...
- ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    ┌────────────────────┐    ┌────────────────────┐    ┌───────────────────────┐
- │ Workspace          │──▶│ Intent/Scope Agent │──▶│ Research Planner   │──▶│ Search Orchestrator │──▶│ Evidence Analyzer   │──▶│ Research progress    │──▶│ Results                 │
- │ (page.tsx)          │    │ (Ollama + Qwen3)    │    │ (Ollama + Qwen3)    │    │ (SerpApi, no LLM)    │    │ (Ollama + Qwen3)     │    │ (research/page.tsx)  │    │ (results/page.tsx)      │
- └──────────────────┘    └──────────────────┘    └──────────────────┘    └──────────────────┘    └────────────────────┘    └────────────────────┘    └───────────────────────┘
-                                                                                      │                          │                                                     ▲
-                                                                                      └──────────────────────────┴─────────── lib/pipeline-store.ts ───────────────────┘
-                                                                                                                     (in-memory handoff, not the URL)
+
+The workspace calls stages sequentially through `lib/api-client.ts`. It sends only each stage's required input: query; then query plus intent; then plan; then plan plus search run; then plan plus evidence analysis. Each API route validates its own JSON request with Zod before calling the corresponding `lib/` service.
+
+If one of the five workspace calls returns an HTTP/API error, the workspace shows the error beneath the input and stays on `/`. The earlier completed stage outputs are not persisted for a resume; a retry starts the query from stage 1. Internal per-item failures are different: the search stage records failures per query, the Evidence Analyzer records failures per hypothesis, and the Problem Generator records failures per hypothesis. Those can still produce an overall successful response.
+
+## What is stored and when
+
+After all five stages return, `app/page.tsx` calls `setPipelineResult()` with:
+
+```ts
+{
+  query,
+  intent,
+  plan,
+  searchRun,
+  analysis,
+  problemGeneration,
+}
 ```
 
-1. The user types a query (optionally guided by a Quick Start option or
-   chip) on `/` and submits it.
-2. `page.tsx`'s single `handleSubmit()` calls `requestIntentScope(query)`
-   (`lib/api-client.ts`), which `POST`s to `/api/intent`. That route runs
-   the Intent/Scope Agent against the local LLM, validates its JSON, logs
-   both the input and the parsed result to the server console, and
-   returns the parsed `IntentScope`.
-3. On success, `handleSubmit` immediately calls
-   `requestResearchPlan(query, intent)`, which `POST`s that validated
-   `IntentScope` to `/api/plan`. That route runs the Research Planner
-   against the local LLM, validates its JSON (both structurally and
-   against the deterministic duplicate/near-duplicate checks described in
-   `docs/README.md`), logs the input and result to the server console,
-   and returns the validated `ResearchPlan`.
-4. On success, `handleSubmit` immediately calls `requestSearchRun(plan)`,
-   which `POST`s that exact `ResearchPlan` to `/api/search` — no new plan
-   is generated and no LLM is called here. That route runs the Search
-   Orchestrator against real SerpApi queries, budget-bounded and
-   deduplicated as described in `docs/README.md`, and returns the
-   resulting `SearchRun`.
-5. On success, `handleSubmit` immediately calls
-   `requestEvidenceAnalysis(plan, searchRun)`, which `POST`s that exact
-   `ResearchPlan` and `SearchRun` to `/api/analyze` — no new plan or
-   search is run here, only evidence interpretation over the results
-   already retrieved. That route runs the Evidence Analyzer against the
-   local LLM hypothesis-by-hypothesis, validates its structured output
-   (including the groundedness and recency checks described in
-   `docs/README.md`), and returns the resulting `EvidenceAnalysisRun`,
-   with individual hypothesis failures isolated rather than thrown (see
-   the note on this below).
-6. On success, `handleSubmit` calls `setPipelineResult({ query, intent,
-   plan, searchRun, analysis })` (`lib/pipeline-store.ts` — an in-memory
-   module singleton, not the URL or a database) and only then
-   `router.push`es to `/research?q=<query>`. The query itself still
-   travels through the URL (so `/research` and `/results` stay
-   independently loadable/shareable by query text), but the actual
-   pipeline data travels through the store, since it's too large and
-   structured for a URL param.
-7. On failure at any of the four stages (Ollama not running, bad model
-   output, validation failure, SerpApi misconfigured, etc.), the page
-   shows the error message returned by that stage's API under the input
-   and never navigates — the user can fix their local setup and resubmit.
-   A failure partway through means the earlier stage(s) already
-   succeeded; the user only resubmits the whole query, since the pipeline
-   isn't resumable mid-stage yet. In practice, the Evidence Analyzer
-   almost never reaches this page-level error path — see below.
-8. `/research` simulates a multi-stage research run and, once "complete,"
-   lets the user continue to `/results?q=<query>`. It doesn't read the
-   pipeline store itself — it's purely a cosmetic timer.
-9. `/results` reads `q` back out of the URL (for display only) and calls
-   `getPipelineResult()` once, via lazy `useState` initialization. If a
-   result is there (the normal case, following the flow above), it
-   renders `SearchResultsPanel` with the real `plan`/`searchRun`, followed
-   by `EvidenceAnalysisPanel` with the real `analysis`, above the mock
-   `Problem[]` list; if not (e.g. the user reloaded `/results` directly,
-   which clears the in-memory store), it silently falls back to rendering
-   only the mock list, exactly as before this wiring existed.
+`lib/pipeline-store.ts` holds this value in a module-level variable in the browser's JavaScript runtime. Next.js client navigation keeps that module available between the workspace and results page in the same tab. It is not a database, server session, URL payload, or cross-tab store. Reloading the page resets it.
 
-**Per-hypothesis failure is not a page-level error.** The Evidence
-Analyzer (unmodified — see `docs/README.md`) isolates failures per
-hypothesis: if the local LLM is completely unreachable, `/api/analyze`
-still returns HTTP 200 / `ok: true`, with every hypothesis's `status`
-set to `"failed"` and an `error` message attached. This means the red
-page-level error banner in step 7 essentially never fires for this
-stage under realistic conditions — instead, `EvidenceAnalysisPanel`
-renders each failed hypothesis in place with an "Analysis failed" badge
-and its error text, which is the intended graceful-degradation behavior
-of the analyzer, not a gap in this wiring.
+The original query is encoded in the URL for `/research` and `/results`, where it is used for display. The structured outputs are read from `getPipelineResult()` once when `/results` initializes. If the store is empty—such as after reload or direct navigation—the current page falls back to `MOCK_PROBLEMS` and does not re-run the pipeline.
 
-Passing the query via the URL (rather than a store or context) keeps
-each route independently loadable and keeps the door open for `/results`
-and `/research` to become server-rendered against a real API later
-without a state-management rewrite. The pipeline result itself uses the
-module-singleton store described above precisely because it doesn't fit
-that constraint — it doesn't survive a reload, and that's an accepted
-tradeoff until there's a real backend to fetch it from instead.
+## Progress page timing
+
+`app/research/page.tsx` begins only after the real pipeline has returned and the result is stored. It advances through the six display stages in `lib/mock-data.ts`, roughly every 900 ms. These six labels are presentation copy, not live statuses from the five server stages or Gap Analysis. `components/research-progress.tsx` only renders the stage array and progress bar it receives; the page owns the timer.
+
+## Results page responsibilities
+
+`app/results/page.tsx` reads the current query parameter and pipeline store. If a pipeline result exists:
+
+1. `SearchResultsPanel` receives the real `ResearchPlan` and `SearchRun` and groups results by hypothesis, displaying search/budget stats and failed/skipped query counts.
+2. `EvidenceAnalysisPanel` receives the real `EvidenceAnalysisRun` and displays status, stance, relevance, recency, summaries, and source links per hypothesis.
+3. The page then renders the illustrative `MOCK_PROBLEMS` data using `ResultsSummary` and `ProblemCard`.
+
+Although `problemGeneration` is included in the stored result, the current page only logs it to the browser console; it does not render `CandidateProblem`s. Gap-analysis results are not in `PipelineResult` and are not rendered either. `ProblemCard` expects the older `Problem` model (`title`, `description`, recurrence counts and tags), while generated candidates use the distinct `CandidateProblem` model with evidence-grounded fields and references.
 
 ## Component responsibilities
 
-### `components/problem-radar-header.tsx`
+### Workspace
 
-Static site-wide top bar (logo + wordmark). Rendered once, in
-`app/layout.tsx`, so every route gets it automatically. No state, no
-props.
+- `app/page.tsx`: owns query text, Quick Start context, stage messages, submission guard, errors, and pipeline call order.
+- `components/exploration-input.tsx`: controlled textarea and submit affordance; Ctrl/Cmd+Enter delegates to the page.
+- `components/quick-start-options.tsx`: renders static guided options/chips and calls the page callbacks. It does not submit or call APIs.
 
-### `components/exploration-input.tsx` (client)
+### Progress and results
 
-Owns the presentation of the natural-language input: the `Textarea`,
-the "Discover Problems" submit `Button`, the ⌘/Ctrl+Enter shortcut, and
-an optional dismissible badge showing which Quick Start option or chip
-is currently guiding the input. It is fully controlled — the parent page
-owns `value` and passes `onChange` / `onSubmit` — so it has no opinion
-about what happens after submit, including the `isSubmitting` loading
-state that now spans all four of the `/api/intent`, `/api/plan`,
-`/api/search`, and `/api/analyze` calls.
+- `app/research/page.tsx`: reads the query and owns the demo timer plus the continue button.
+- `components/research-progress.tsx`: presentational stage list/progress bar.
+- `app/results/page.tsx`: reads the query and stored outputs, chooses whether real evidence panels can render, then supplies mock problems to the existing card UI.
+- `components/search-results-panel.tsx`: presentational renderer for `ResearchPlan` + `SearchRun`.
+- `components/evidence-analysis-panel.tsx`: presentational renderer for `EvidenceAnalysisRun`.
+- `components/problem-card.tsx`: interactive evidence toggle for the mock `Problem` type.
+- `components/results-summary.tsx`: derives summary counts from the `Problem[]` provided; currently those are mock values.
+- `components/problem-radar-header.tsx`: static site header rendered from the root layout.
+- `components/ui/*`: generic Radix/shadcn-style primitives without ProblemRadar pipeline responsibilities.
 
-### `components/quick-start-options.tsx` (client)
+## Stage 6: Gap Analysis is separate today
 
-Renders the three Quick Start `Card`s (Discover Problems / Explore an
-Area / Investigate a Problem) and the People/Industry/Location chip row.
-It reads its option and chip data directly from `lib/mock-data.ts`
-(since that data is static configuration, not something a page needs to
-vary), but calls back up to the parent (`onSelectOption` /
-`onSelectChip`) so the page decides what selecting one actually does to
-the input value and URL.
+`lib/api-client.ts` exports `requestGapAnalysis(problems)`, which calls `POST /api/analyze-gaps`. That route validates `CandidateProblem[]` and invokes `runGapAnalysis()` in `lib/llm/gap-analyzer.ts`. The service performs focused SerpApi searches and uses the LLM to synthesize evidence-backed solutions and unresolved gaps. It returns a `GapAnalysisResult` with source references and per-candidate status.
 
-### `components/research-progress.tsx`
+No current page calls `requestGapAnalysis()`. The workspace stops after candidate problem generation, and the pipeline store and results page do not yet include this output. To wire the stage into the product flow, the next implementation would need to call it with the generated candidate list, add its result to the handoff type, and create a results renderer.
 
-Purely presentational: given a `ResearchStage[]` (and optionally the
-original query string), it renders a progress bar and a vertical stage
-list with status icons (complete / active / pending). It has no timers
-or side effects of its own — `app/research/page.tsx` owns the mock
-timer and passes updated stage arrays down as props. This means swapping
-the mock timer for a real streaming/polling source later only touches
-the page, not this component.
+## Data boundaries
 
-### `components/problem-card.tsx` (client)
-
-Renders one `Problem`: title, recurrence badge, description, tags,
-evidence/recurrence counts, and an expandable "View Evidence" list of
-sources. The only local state is whether the evidence list is expanded.
-
-### `components/results-summary.tsx`
-
-Purely presentational aggregate stats (problems found, high-recurrence
-count, total evidence sources) computed from whatever `Problem[]` it is
-given.
-
-### `components/search-results-panel.tsx`
-
-Purely presentational, like `results-summary.tsx`: given the real `plan`
-(`ResearchPlan`) and `searchRun` (`SearchRun`) from the pipeline store, it
-groups `searchRun.results` by `hypothesis_id`, renders budget/execution
-stats, and flags failed or skipped queries. No fetching, no re-running
-the orchestrator, and no scoring/ranking of what it's given.
-
-### `components/evidence-analysis-panel.tsx`
-
-Purely presentational, like `search-results-panel.tsx`: given the real
-`analysis` (`EvidenceAnalysisRun`) from the pipeline store, it renders one
-card per hypothesis with a status badge (`Analyzed` / `No evidence` /
-`Analysis failed`) and, for analyzed hypotheses, one entry per piece of
-evidence with its stance (`Supports` / `Challenges` / `Neutral`, reusing
-the existing `Badge` variants), relevance, recency, summary, and a link
-back to the original source. No fetching, no scoring/ranking — that's a
-future stage's job, not this component's.
-
-### `components/ui/*`
-
-shadcn/ui-style primitives only (Button, Card, Textarea, Badge,
-Separator, Progress, Tabs, Skeleton, Tooltip). These have no
-ProblemRadar-specific logic and should stay that way — anything
-domain-specific belongs in `components/`, not `components/ui/`.
-
-## State ownership
-
-There is no global store or state-management library. Each page owns the
-state relevant to it:
-
-- `app/page.tsx` — the input text, which Quick Start option/chip is
-  active, whether the `/api/intent` → `/api/plan` → `/api/search` →
-  `/api/analyze` chain is in flight (`isSubmitting`), the current stage's
-  status message, and any error message from any of the four calls.
-- `app/research/page.tsx` — the mock stage array and whether the mock
-  run has finished.
-- `app/results/page.tsx` — the pipeline result read once from
-  `lib/pipeline-store.ts` (a plain module-level singleton, not a
-  React context or a store library — see "Page flow" above); `Tabs`
-  manages its own selected-filter state internally (uncontrolled).
-
-## Data flow
-
-```
-types/  ──defines shapes──▶  lib/mock-data.ts  ──imported by──▶  components / pages
-   │
-   └──defines shapes──▶  lib/llm/ (intent-agent.ts)        ──called by──▶  app/api/intent/route.ts  ──┐
-   └──defines shapes──▶  lib/llm/ (research-planner.ts)    ──called by──▶  app/api/plan/route.ts    ──┤
-   └──defines shapes──▶  lib/search/ (search-orchestrator.ts) ──called by──▶  app/api/search/route.ts ──┤
-   └──defines shapes──▶  lib/llm/ (evidence-analyzer.ts)   ──called by──▶  app/api/analyze/route.ts  ──┴──fetched by──▶  lib/api-client.ts  ──called by──▶  app/page.tsx
-                                                                                                                                                                    │
-                                                                                                                                    setPipelineResult() ◀───────────┘
-                                                                                                                                            │
-                                                                                                                              lib/pipeline-store.ts
-                                                                                                                                            │
-                                                                                                              getPipelineResult() ──read by──▶  app/results/page.tsx  ──renders──▶  SearchResultsPanel, EvidenceAnalysisPanel
+```text
+types/  ── shared shapes ──▶ API routes ──▶ lib services
+  ▲                              ▲               │
+  │                              │               ├─ LLMProvider → Ollama
+  │                              │               └─ search client → SerpApi
+  │                              │
+components/pages ◀── api-client.ts ◀── browser fetch responses
+       │
+       └─ pipeline-store.ts transports stage 1–5 outputs across client navigation
 ```
 
-All three agents share `lib/llm/json-utils.ts` for parsing raw model
-text and `lib/llm/index.ts`'s `getLLMProvider()` for talking to the
-model, so adding the Research Planner and the Evidence Analyzer each
-required no changes to the provider layer itself. The Search
-Orchestrator is deterministic code, not an agent, so it has no provider
-dependency at all — see `lib/search/config.ts` and `serpapi-client.ts`.
-
-`types/` has no dependencies on React, mock data, or the LLM layer — it
-only describes shapes (`Problem`, `ResearchStage`, `QuickStartOption`,
-`IntentScope`, `ResearchPlan`, etc.). This is what makes it safe to later replace
-`lib/mock-data.ts` with a real data source, or `lib/llm/`'s Ollama
-provider with a different one, without changing any component: as long
-as the new source returns the same shapes, the UI is unaffected. See
-`docs/DEVELOPMENT.md` for how the `LLMProvider` abstraction is meant to
-be extended.
+`types/` describes contracts but does not implement validation. Routes and agent/service code use Zod schemas at runtime. The LLM provider abstraction is in `lib/llm/provider.ts`; Ollama-specific HTTP handling stays in `lib/llm/providers/ollama-provider.ts`. SerpApi response handling stays in `lib/search/serpapi-client.ts`. This keeps UI components independent of vendor request formats.

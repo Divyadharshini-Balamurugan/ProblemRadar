@@ -1,256 +1,112 @@
 # Development Guide
 
-## Running the project
+## Requirements and commands
+
+Use Node.js 20.9 or newer (the minimum required by the installed Next.js 16 version).
 
 ```bash
 npm install
 npm run dev
 ```
 
-The app runs at `http://localhost:3000`. Other scripts:
+The app is available at `http://localhost:3000`. Other project scripts:
 
 ```bash
-npm run build         # production build (also type-checks)
-npm run start          # run the production build
-npm run lint            # ESLint
-npm run check:ollama     # confirm Ollama is running + pull the model if missing
+npm run build                  # production build
+npm run start                  # serve the production build
+npm run lint                   # ESLint
+npm test                       # compile and run both unit-test files
+npm run test:problem-generator # candidate problem generator tests
+npm run test:gap-analysis      # gap-analysis tests
 ```
 
-Requires Node.js 18.18+ (Node 20 LTS or newer recommended).
+There is no `check:ollama` script in the current `package.json`; use the Ollama commands below to check setup manually.
 
-## One-time setup for the Intent/Scope Agent + Research Planner (Ollama)
+## Configure Ollama
 
-Submitting the workspace input now runs all three real backend stages in
-sequence — Intent/Scope Agent, then Research Planner, then the Search
-Orchestrator (see "Application wiring" in `docs/README.md`) — so this
-one-time setup (plus the SerpApi setup below) is required before
-`npm run dev` will produce results instead of an error banner under the
-input:
+Stages 1, 2, 4, and 5 use the configured LLM provider. The current provider is Ollama, with defaults of `http://localhost:11434`, model `qwen3:8b`, and a 240-second request timeout.
 
-1. Install Ollama from https://ollama.com/download (Windows, macOS, or
-   Linux). On Windows/macOS it starts automatically in the background
-   after install; on Linux run `ollama serve` in a terminal.
-2. Pull the model the agent expects:
+1. Install Ollama from [ollama.com/download](https://ollama.com/download) and start its server.
+2. Pull the configured model:
+
    ```bash
    ollama pull qwen3:8b
    ```
-   or just run `npm run check:ollama`, which checks Ollama is reachable
-   and pulls the model for you if it's missing.
-3. Start the app as normal (`npm run dev`) and submit something on `/`.
-   You should see request/response logging in the **terminal running
-   `npm run dev`** (not the browser console) for each stage in order:
-   the raw text you typed and the parsed Intent/Scope JSON from
-   `/api/intent`, then that same Intent/Scope JSON and the generated
-   ResearchPlan JSON from `/api/plan`, then the plan's search queries and
-   a `SearchRun` summary from `/api/search`, then that same plan and
-   SearchRun and the resulting per-hypothesis evidence from
-   `/api/analyze` — plus a per-request status line
-   (`POST /api/intent 200 in ...`) for each, since this only appears
-   under `next dev`, not `next start`.
 
-If Ollama isn't running or the model isn't pulled, submitting the input
-shows a clear error message under the textarea instead of failing
-silently — the error text tells you exactly what to fix (this applies to
-any of the four stages; each call only happens after the previous one
-has already succeeded). Note that the Evidence Analyzer (stage 4) is an
-exception in practice: it isolates failures per hypothesis rather than
-throwing, so a completely unreachable Ollama still returns a successful
-`/api/analyze` response with every hypothesis marked `"failed"` — see
-"Application wiring" in `docs/README.md`.
+3. Start the app and submit a query. Server-side request and model logs appear in the terminal running the app.
 
-To point at a different model or a remote Ollama instance, copy
-`.env.example` to `.env.local` and adjust `OLLAMA_BASE_URL` /
-`OLLAMA_MODEL`. No other code changes are needed.
+Copy `.env.example` to `.env.local` to change `LLM_PROVIDER`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, or `OLLAMA_TIMEOUT_MS`. The API route handlers and LLM services run server-side; do not rename secret settings with a `NEXT_PUBLIC_` prefix.
 
-## One-time setup for the Search Orchestrator (SerpApi)
+Gap Analysis also calls the same LLM provider, but it is currently an independent endpoint and is not invoked from the workspace flow.
 
-`POST /api/search` (stage 3) needs a real SerpApi key to make real
-searches — it does not use Ollama or any LLM.
+## Configure SerpApi
 
-1. Get a key at https://serpapi.com/manage-api-key (SerpApi has a free
-   tier with a monthly search allowance, enough for local development).
-2. Copy `.env.example` to `.env.local` (if you haven't already) and set
-   `SERPAPI_API_KEY=<your key>`.
-3. Submitting the workspace input now calls `/api/search` automatically
-   after `/api/plan` succeeds (see "Application wiring" in
-   `docs/README.md`), so a real key here is what turns the Search
-   Evidence panel on `/results` from all-`"error"` executions into real
-   results. You can still call `/api/search` directly with a hand-written
-   `ResearchPlan` for isolated testing — see the `curl` example in
-   `app/api/search/route.ts`'s comment header. It does not require going
-   through `/api/intent` or `/api/plan` first.
+Stages 3 and 6 use SerpApi for web search. Set a key in `.env.local`:
 
-Without a key, every query comes back as a graceful per-query `"error"`
-execution (`SerpApiError` with `kind: "empty_key"`) instead of a crash —
-useful for exercising the orchestrator's dedup/budget logic without
-spending real API quota, but you won't get real results back that way.
-`SERPAPI_TIMEOUT_MS`, `SERPAPI_RESULTS_PER_QUERY`, and `SERPAPI_DELAY_MS`
-(see `.env.example`) tune the same stage without any code changes.
-
-## Where things belong
-
-| If you're adding...                                   | It goes in...                          |
-| ------------------------------------------------------- | ---------------------------------------- |
-| A new route / page                                      | `app/<route>/page.tsx`                    |
-| A layout shared by a route segment                       | `app/<route>/layout.tsx`                  |
-| A ProblemRadar-specific, reusable UI piece                | `components/<kebab-case-name>.tsx`         |
-| A generic shadcn/ui primitive (Button, Dialog, etc.)      | `components/ui/<name>.tsx`                 |
-| A pure helper function / class-merging util                | `lib/`                                     |
-| Mock or real data-fetching helpers                         | `lib/`                                     |
-| A new API route (server-side only logic)                    | `app/api/<name>/route.ts`                    |
-| LLM provider code or a new agent                             | `lib/llm/` (see below)                        |
-| A shared TypeScript type/interface                        | `types/<domain>.ts`, re-exported from `types/index.ts` |
-| Static assets (images, icons, fonts)                        | `public/`                                  |
-| Project documentation                                       | `docs/`                                    |
-
-Page files (`app/**/page.tsx`) should stay focused on composing
-components and owning page-level state (e.g. what's in the URL, what a
-mock timer is doing) — the actual UI building blocks belong in
-`components/`.
-
-## Adding a new shadcn/ui component
-
-This project's `components/ui/` primitives are hand-authored to match
-the standard shadcn/ui API (Radix UI primitive + `class-variance-authority`
-+ the shared `cn()` helper from `lib/utils.ts`), because the shadcn CLI's
-registry (`ui.shadcn.com`) may not be reachable from every network this
-project is developed on. `components.json` is still present and
-shadcn-CLI-compatible, so if you have registry access, you can use the
-CLI as normal:
-
-```bash
-npx shadcn@latest add dialog
+```text
+SERPAPI_API_KEY=your-key
 ```
 
-If the CLI can't reach the registry, add a component by hand instead:
+The defaults and optional settings are in `.env.example`: `SERPAPI_BASE_URL`, `SERPAPI_TIMEOUT_MS`, `SERPAPI_RESULTS_PER_QUERY`, and `SERPAPI_DELAY_MS`. Without a key, stage 3 records each search as a per-query error and can still return a `SearchRun`; it will not produce real sources for analysis or candidate generation. Stage 6 similarly requires usable SerpApi results to analyze solutions and gaps.
 
-1. Install its Radix primitive (and any other runtime dependency) via
-   npm, e.g. `npm install @radix-ui/react-dialog`.
-2. Create `components/ui/<name>.tsx` following the pattern already used
-   in this folder: a thin wrapper around the Radix primitive, styled
-   with Tailwind utility classes and the `cn()` helper, exporting one
-   named function per sub-part (e.g. `Dialog`, `DialogTrigger`,
-   `DialogContent`).
-3. Reference the official shadcn/ui docs (https://ui.shadcn.com/docs/components)
-   for the exact class names/structure of the component you're adding,
-   so it stays visually consistent with the rest of the kit.
-4. Import it in ProblemRadar-specific components the same way as the
-   existing primitives: `import { Dialog } from "@/components/ui/dialog"`.
+Search uses the same SerpApi configuration for both stages. The gap analyzer makes up to five focused searches per candidate, requests five results per query, and keeps at most eight unique source items per candidate. It can be called directly with `POST /api/analyze-gaps`, but the workspace does not currently make that call.
 
-Never introduce a different component library (Chakra, MUI, Ant, etc.)
-alongside shadcn/ui — pick the closest existing primitive or add a new
-shadcn-style one instead.
+## Current workspace execution
 
-## Adding a new LLM agent or provider
+Submitting `/` runs these calls sequentially:
 
-`lib/llm/intent-agent.ts`, `lib/llm/research-planner.ts`, and
-`lib/llm/evidence-analyzer.ts` are three worked examples of the same
-pattern — follow it for the next agent:
+1. `POST /api/intent` — query to structured intent/scope.
+2. `POST /api/plan` — intent/scope to research hypotheses and a budget.
+3. `POST /api/search` — plan to normalized web results and execution accounting.
+4. `POST /api/analyze` — plan and search results to source-level evidence analysis.
+5. `POST /api/generate-problems` — plan and analysis to candidate problems.
 
-1. Define its output shape in `types/` (see `types/intent.ts` or
-   `types/research-plan.ts`).
-2. Write a Zod schema for that shape, and a system prompt + prompt
-   builder function describing exactly what JSON to return.
-3. Call `getLLMProvider()` (`lib/llm/index.ts`) and its
-   `generateJSON({ system, prompt })` — never call `fetch` to an LLM
-   endpoint directly from an agent or a route.
-4. Parse the raw text defensively using the shared helpers in
-   `lib/llm/json-utils.ts` (`stripThinking`, `extractJsonObject`), then
-   validate with your Zod schema. Throw a typed error (see
-   `IntentParseError` / `ResearchPlanParseError`) on failure rather than
-   passing unvalidated data downstream.
-5. If the stage has rules a JSON schema can't express on its own (e.g.
-   "no two items may be near-duplicates," as in the Research Planner's
-   `assertHypothesesAreSound`, or "this text must actually derive from
-   the source it claims to summarize," as in the Evidence Analyzer's
-   `isGrounded` check), add a plain-code check after schema validation
-   rather than trusting the model to self-police it — throw the same
-   typed parse error on violation so callers handle it one way.
-6. Call the agent from an `app/api/<name>/route.ts` route handler, which
-   should validate its own request body with Zod and log both the input
-   and the validated output to the server console.
-7. If one call covers several independent units of work (the Evidence
-   Analyzer calls the model once per hypothesis), wrap each unit's call
-   in its own try/catch and record a per-unit failure outcome instead of
-   letting one bad unit fail the whole request — same principle as the
-   Search Orchestrator's per-query error handling, just applied to an
-   LLM call instead of a third-party API call.
+Only after these calls finish does the app save the outputs in the client-side `lib/pipeline-store.ts` and navigate to `/research`. That page is a timed visual progression, not live server progress. `/results` renders the search/evidence outputs when the in-memory store is present, but candidate problems are currently only logged; the problem cards still use `MOCK_PROBLEMS`. Reloading clears the store.
 
-To add a **second provider** (a hosted API, a different local runtime):
-write a new class in `lib/llm/providers/` implementing `LLMProvider`
-(`lib/llm/provider.ts`), then add one `case` to the switch in
-`getLLMProvider()` (`lib/llm/index.ts`). No agent or route code should
-need to change — that's the point of coding against the interface
-instead of a specific provider's SDK.
+`POST /api/analyze-gaps` is stage 6 in the overall capability set, but is not called by the workspace. `requestGapAnalysis()` is already available in `lib/api-client.ts`. Wiring it into the flow requires sending the generated candidate problems to it, adding its result to the pipeline handoff, and presenting its `GapAnalysisResult` in the UI.
 
-## Adding a deterministic (non-LLM) service stage
+## Where code belongs
 
-`lib/search/` (stage 3, the Search Orchestrator) is the worked example
-for a pipeline stage that's plain deterministic code, not an LLM agent —
-follow it for the next one (e.g. an evidence-analysis stage that just
-filters/groups already-fetched results without calling a model):
+| Change | Location |
+| --- | --- |
+| Page or route handler | `app/<route>/page.tsx` or `app/api/<name>/route.ts` |
+| Shared layout | `app/<segment>/layout.tsx` |
+| ProblemRadar-specific component | `components/<kebab-case-name>.tsx` |
+| Generic UI primitive | `components/ui/<name>.tsx` |
+| LLM provider/agent/service | `lib/llm/` |
+| Search configuration, client, or orchestration | `lib/search/` |
+| API request wrapper used by the browser | `lib/api-client.ts` |
+| Shared data shape | `types/<domain>.ts`, exported from `types/index.ts` |
+| Static/mocked UI data | `lib/mock-data.ts` |
+| Tests | `tests/` |
+| Project documentation | `docs/` |
 
-1. Define its output shape in `types/` (see `types/search.ts`), same as
-   an agent stage.
-2. Put env-driven config (API keys, timeouts, tunable limits) in its own
-   `config.ts`, read via a single exported const object — never
-   `process.env` scattered through the rest of the module. Never expose
-   an API key to the client; these modules are only ever imported from
-   server code (route handlers, other `lib/` services).
-3. Isolate the third-party API's actual request/response shape in one
-   client file (see `serpapi-client.ts`) with a typed error class
-   (`kind` field for distinguishing failure modes) — nothing else in the
-   app should know that shape.
-4. Put the orchestration logic (budgeting, deduplication, sequencing,
-   normalization) in its own module, and wrap every external call in its
-   own try/catch so one failure never aborts the whole run — record it as
-   a typed outcome instead of throwing out of the function.
-5. Call it from an `app/api/<name>/route.ts` route handler with its own
-   Zod request schema — don't import another stage's internal/unexported
-   schema; depend only on the shared `types/` shape so stages stay
-   independently testable and swappable.
-6. Log the input, every unit of work's outcome, and a final summary to
-   the server console, same as the LLM agents do.
+Keep route handlers responsible for request validation and HTTP responses. Put pipeline behavior in `lib/` services so it can be called independently and tested with injected dependencies. Keep third-party request/response details inside their client modules.
 
-## Naming and structure rules
+## LLM service pattern
 
-- **Components**: kebab-case filenames (`problem-card.tsx`), one
-  component's primary export per file, PascalCase export name
-  (`ProblemCard`).
-- **`components/ui/`** is reserved for generic, ProblemRadar-agnostic
-  primitives only. If a component encodes ProblemRadar concepts (a
-  "Problem," a "research stage," a "Quick Start option"), it belongs in
-  `components/`, not `components/ui/`.
-- **Types**: one file per domain in `types/` (`problem.ts`,
-  `research.ts`, `exploration.ts`, `intent.ts`), all re-exported from
-  `types/index.ts` so consumers can `import type { Problem } from "@/types"`.
-- **Mock data**: keep all of it in `lib/mock-data.ts` for now. If it
-  grows unwieldy, split by domain (`lib/mock-problems.ts`, etc.) rather
-  than inlining mock arrays inside components or pages. (This does not
-  apply to `lib/llm/` — that's real logic, not mock data.)
-- **No premature abstraction**: don't add hooks, context providers, or a
-  state-management library until an actual page needs them. `useState`
-  in the owning page is enough for this MVP. API routes and `lib/llm/`
-  are the exception — they exist because the Intent/Scope Agent and
-  Research Planner genuinely need server-side code (API keys/local ports
-  shouldn't be reachable from the client, and LLM calls shouldn't block
-  rendering).
-- **Client vs. server components**: default to server components
-  (no `"use client"`). Add `"use client"` only to components that use
-  state, effects, or browser-only APIs (e.g. `ExplorationInput`,
-  `QuickStartOptions`, `ProblemCard`, and the two pages that read
-  `useSearchParams`). Route handlers under `app/api/` are always
-  server-only regardless of this rule.
+The Intent Agent, Research Planner, Evidence Analyzer, Problem Generator, and Gap Analyzer share the `LLMProvider` contract in `lib/llm/provider.ts`. They obtain the provider from `getLLMProvider()` rather than calling Ollama directly. The Ollama-specific HTTP handling lives in `lib/llm/providers/ollama-provider.ts`.
 
-## Keeping docs in sync
+For a new LLM-backed stage:
 
-Whenever you add, remove, or move a page or a component in a way that
-changes the folder structure or the page flow, update:
+1. Define its request/result types in `types/` and export them from `types/index.ts`.
+2. Validate the API request with a route-local Zod schema.
+3. Put the prompt and business logic in a service under `lib/llm/`.
+4. Parse model text with helpers in `lib/llm/json-utils.ts` and validate the output with Zod plus deterministic checks where needed.
+5. Use `withRetry()` only for recoverable invalid model output. Do not retry a provider connection failure as though it were malformed JSON.
+6. For independent work units, isolate failures at that unit (query, hypothesis, or candidate) and return status/error information with the successful work.
+7. Add focused tests using injected providers and search functions rather than external services.
 
-- `docs/README.md` — folder structure, page list, or scope
-  (implemented vs. not-yet-implemented) if either changed.
-- `docs/UI-ARCHITECTURE.md` — the page flow diagram or a component's
-  responsibility if you changed how data moves between pages/components.
+## Search/service pattern
 
-Small documentation is easy to keep honest — prefer trimming stale
-sentences over letting them drift.
+`lib/search/serpapi-client.ts` isolates SerpApi's network and response format. `lib/search/search-orchestrator.ts` owns query budgeting, deduplication, normalization, and per-query outcomes. Gap Analysis reuses the SerpApi client while building its own candidate-specific query plan in `lib/llm/gap-analyzer.ts`.
+
+Keep API keys server-only and configuration centralized. For any new external call, set a timeout and return useful per-unit failure data where the rest of the run can continue.
+
+## UI conventions
+
+- App Router pages and layouts follow the installed Next.js documentation under `node_modules/next/dist/docs/`; repository-specific requirements are in `AGENTS.md`.
+- Use server components by default. Add `"use client"` for components that need state, effects, browser APIs, or client navigation hooks.
+- Product-specific UI belongs in `components/`; reusable primitives belong in `components/ui/`.
+- Keep `types/` independent of React and service implementation details.
+- When page flow or data handoff changes, update `docs/README.md` and `docs/UI-ARCHITECTURE.md` in the same change.

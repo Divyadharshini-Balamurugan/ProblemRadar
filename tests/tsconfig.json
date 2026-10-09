@@ -9,5 +9,5 @@
     "rootDir": "..",
     "outDir": "../.test-out"
   },
-  "include": ["./problem-generator.test.ts", "./gap-analysis.test.ts"]
+  "include": ["./problem-generator.test.ts", "./gap-analysis.test.ts", "./search-orchestrator.test.ts", "./evidence-analyzer.test.ts", "./problem-ranker.test.ts", "./final-result.test.ts"]
 }

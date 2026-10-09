@@ -1,4 +1,4 @@
-import type { CandidateProblem, EvidenceAnalysisRun, GapAnalysisResult, IntentScope, ProblemGenerationResult, ResearchPlan, SearchRun } from "@/types";
+import type { CandidateProblem, EvidenceAnalysisRun, GapAnalysisResult, IntentScope, ProblemGenerationResult, ProblemRankingResult, ResearchPlan, SearchRun } from "@/types";
 
 interface IntentApiResponse {
   ok: boolean;
@@ -146,6 +146,25 @@ export async function requestGapAnalysis(problems: CandidateProblem[]): Promise<
   const data = (await response.json().catch(() => null)) as { ok: boolean; result?: GapAnalysisResult; error?: string } | null;
   if (!response.ok || !data?.ok || !data.result) {
     throw new Error(data?.error ?? "Gap Analysis could not process this request.");
+  }
+  return data.result;
+}
+
+/** Client-side call to Problem Ranking (POST /api/rank-problems). Deterministic — no LLM, no search. */
+export async function requestProblemRanking(
+  problems: CandidateProblem[],
+  gapAnalysis: GapAnalysisResult
+): Promise<ProblemRankingResult> {
+  const response = await fetch("/api/rank-problems", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ problems, gap_analysis: gapAnalysis }),
+  });
+  const data = (await response.json().catch(() => null)) as
+    | { ok: boolean; result?: ProblemRankingResult; error?: string }
+    | null;
+  if (!response.ok || !data?.ok || !data.result) {
+    throw new Error(data?.error ?? "The Problem Ranker could not process this request.");
   }
   return data.result;
 }

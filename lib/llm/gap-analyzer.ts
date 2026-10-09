@@ -67,13 +67,20 @@ function truncate(text: string, maxLength: number): string {
 
 /**
  * Deterministic, problem-specific query templates. All of them are built
- * from the candidate's own statement/affected population, so they can't
- * drift into unrelated broad queries like "rural problems".
+ * from the candidate's own statement/affected population/activity, so they
+ * can't drift into unrelated broad queries like "rural problems". When the
+ * candidate carries validated observations, the most specific anchor — the
+ * observation itself, i.e. the actual friction — leads the list, with the
+ * synthesized statement following for breadth.
  */
 export function buildGapQueries(problem: CandidateProblem): string[] {
   const statement = problem.problem_statement.replace(/\.$/, "").trim();
   const population = problem.affected_population.trim();
+  const observation = (problem.observations ?? [])
+    .map((entry) => entry.claim.trim().replace(/\.$/, ""))
+    .filter((claim) => claim.length >= 12)[0];
   const candidates = [
+    ...(observation ? [`${truncate(observation, 160)} solutions`] : []),
     `${statement} existing solutions programs services`,
     `${population} ${problem.affected_activity} programs interventions`,
     `${statement} intervention effectiveness results`,
@@ -106,6 +113,7 @@ async function collectSolutionEvidence(
     try {
       const rawItems = await search(query, { numResults: RESULTS_PER_QUERY });
       queriesExecuted.push(query);
+      console.log(`[ProblemRadar/GapAnalysis] candidate="${problem.id}" query="${query}" — ${rawItems.length} result(s)`);
       for (const item of rawItems) {
         if (items.length >= MAX_KEPT_ITEMS_PER_CANDIDATE) break;
         let key = item.link;
@@ -127,11 +135,17 @@ async function collectSolutionEvidence(
   return { items, queriesExecuted, errors };
 }
 
-function buildPrompt(problem: CandidateProblem, items: NumberedItem[]): string {
+function buildPrompt(problem: CandidateProblem, items: NumberedItem[], correction?: string | null): string {
   const lines = items
     .map(({ index, item }) => `${index}. title: "${truncate(item.title, 160)}" | snippet: "${truncate(item.snippet, 300)}" | source: "${item.source}"`)
     .join("\n");
-  return `Candidate problem (evidence-grounded; context only):
+  const observationLines = (problem.observations ?? [])
+    .map((observation, position) => `${position + 1}. "${truncate(observation.claim, 200)}" (traced to the candidate's own evidence_refs [${observation.evidence_indices.join(", ")}])`)
+    .join("\n");
+  const provenanceLines = problem.evidence_refs
+    .map((ref) => `- ${ref.evidence_id} | "${truncate(ref.evidence_summary, 200)}" (${truncate(ref.title, 120)}; ${ref.source}; ${ref.url})`)
+    .join("\n");
+  return `Candidate problem (evidence-grounded context; the research hypothesis behind it is not supplied and is never evidence):
 "${problem.problem_statement}"
 Affected population: ${problem.affected_population}
 Activity affected: ${problem.affected_activity}
@@ -139,13 +153,24 @@ Context: ${problem.context}
 Mechanism: ${problem.mechanism}
 Observed impact: ${problem.observed_impact}
 
-Real search results about existing solutions for this problem (the only allowed basis):
+Validated observations behind the candidate (atomic claims, each traced to the candidate's own evidence_refs — together with the affected activity above, they define the specific friction to research solutions for):
+${observationLines || "None supplied."}
+
+The candidate's original evidence provenance (what those observations were validated against — what the problem IS, not solution evidence):
+${provenanceLines || "None supplied."}
+
+Real search results about existing solutions for this problem (the only allowed basis for solutions and gaps):
 ${lines}
 
-Task: identify CONCRETE existing solutions (products, services, platforms, programs, policies, organizations, workflows, technologies) that these results establish, what aspects of the candidate problem they address, and what evidence-supported gap REMAINS. Consider availability, coverage, affordability, accessibility, adoption, reliability, capacity, coordination, awareness, and population fit — but report a gap ONLY when the cited results support it. Paraphrase freely, but do not add statistics, populations, geographies, or capabilities the cited items don't state. Never write "no solution exists", "nobody has solved this", or "no competitors" — "no evidence found" is not evidence that nothing exists. Each solution/gap must cite the numbers of its supporting items in evidence_indices.
+Task: identify CONCRETE existing solutions (products, services, platforms, programs, policies, organizations, workflows, technologies) that these results establish, what aspects of the candidate problem — especially the affected activity and friction above — they address, and what evidence-supported gap REMAINS. Describe each solution and explain each gap using only facts, figures, and wording present in the cited results. "addressed_aspects" lists only aspects whose wording literally appears in the cited results above — reuse a word or short phrase from the results themselves. Report a gap ONLY when the cited results support it, and report a solution as failing or as only partially covering the problem ONLY when the cited results state that failure or limitation. Paraphrase freely, but do not add statistics, populations, geographies, or capabilities the cited items don't state, and do not invent coverage distinctions (e.g. "only urban counties") the cited items don't state. Never write "no solution exists", "nobody has solved this", or "no competitors" — "no evidence found" is not evidence that nothing exists. Each solution/gap must cite the numbers of its supporting items in evidence_indices.
 
 Output ONLY this JSON shape:
-{"existing_solutions":[{"name":"...","type":"...","description":"...","target_population":"...","evidence_indices":[1]}],"addressed_aspects":["..."],"unresolved_gaps":[{"gap":"...","explanation":"...","evidence_indices":[1]}],"solution_coverage":"clear|partial|insufficient_solution_evidence","gap_confidence":"high|moderate|low"}`;
+{"existing_solutions":[{"name":"...","type":"...","description":"...","target_population":"...","evidence_indices":[1]}],"addressed_aspects":["..."],"unresolved_gaps":[{"gap":"...","explanation":"...","evidence_indices":[1]}],"solution_coverage":"clear|partial|insufficient_solution_evidence","gap_confidence":"high|moderate|low"}${correction ? `
+
+Your previous attempt was rejected by validation:
+${correction}
+
+Fix exactly that: reword the offending field to match the cited results' own words. Leave every other field as it was.` : ""}`;
 }
 
 /** Groundedness guardrail: a meaningful share of the text's substantive words must appear in the cited sources (same family of check as the Evidence Analyzer's, lenient enough for paraphrase). */
@@ -180,6 +205,35 @@ function hasUnsupportedNumbers(text: string, sourceText: string): boolean {
 /** Absolute "nothing exists" claims ordinary search cannot establish — reject them. */
 const ABSOLUTE_NO_SOLUTION = /(no solution(s)? exist|nobody has solved|no one has solved|no competitors?|market is empty|no service exists|nothing exists)/i;
 
+/**
+ * Words that assert an existing solution fails or is ineffective.
+ * Ordinary search results about a working program cannot establish
+ * that the program fails — such a claim is only allowed when the
+ * cited evidence itself carries a failure, limitation, or gap marker.
+ */
+const SOLUTION_FAILURE_CLAIM = /\b(fail(?:s|ed|ure|ing)?|doesn'?t work|don'?t work|didn'?t work|does not work|do not work|not working|ineffective|ineffectiveness|unsuccessful|abandon(?:ed|s|ing)?|falls? short|unable to|never works?|broken|defunct|does not (?:cover|serve|reach|address|help|include|support)|don'?t (?:cover|serve|reach|address|help|include|support))\b/i;
+const SOLUTION_FAILURE_EVIDENCE = /\b(fail(?:s|ed|ure|ing)?|doesn'?t work|don'?t work|didn'?t work|does not work|do not work|not working|ineffective|ineffectiveness|unsuccessful|abandon(?:ed|s|ing)?|falls? short|unable to|never works?|broken|defunct|limit(?:ed|s|ation|ations)?|lack(?:s|ed|ing)?|shortage|shortages|insufficient|inadequate|gap|gaps|barrier|barriers|challenge|challenges|difficult|partial|scarce|few|underfunded|overburdened|waitlist|waitlists)\b/i;
+
+/**
+ * Invention budget: at most half of a claim's content words may be
+ * absent from the cited evidence (the same budget the Problem
+ * Generator applies per field). This is what rejects grossly
+ * invented coverage distinctions ("only wealthy urban counties")
+ * that happen to share enough vocabulary to pass the semantic
+ * check. Strictly additive: it never accepts what the semantic
+ * check above rejects.
+ */
+function assertWithinInventionBudget(text: string, sourceText: string, what: string, raw: string): void {
+  const words = contentWords(text);
+  if (words.size === 0) return;
+  const sourceWords = contentWords(sourceText);
+  let unsupported = 0;
+  for (const word of words) if (!sourceWords.has(word)) unsupported += 1;
+  if (unsupported > Math.max(3, Math.floor(words.size / 2) + 1)) {
+    throw new GapAnalysisParseError(`${what} contains unsupported claims beyond its cited evidence: ${[...words].filter((word) => !sourceWords.has(word)).join(", ")}.`, raw);
+  }
+}
+
 function assertGapAnalysisSound(
   output: z.infer<typeof GapAnalysisOutputSchema>,
   items: NumberedItem[],
@@ -200,9 +254,13 @@ function assertGapAnalysisSound(
     if (hasUnsupportedNumbers(text, sourceText)) {
       throw new GapAnalysisParseError(`${what} contains a statistic absent from its cited evidence.`, raw);
     }
+    if (SOLUTION_FAILURE_CLAIM.test(text) && !SOLUTION_FAILURE_EVIDENCE.test(sourceText)) {
+      throw new GapAnalysisParseError(`${what} claims an existing solution fails without its cited evidence stating a failure, limitation, or gap — search results cannot establish that.`, raw);
+    }
     if (!isGrounded(text, sourceText)) {
       throw new GapAnalysisParseError(`${what} is not semantically grounded in its cited evidence.`, raw);
     }
+    assertWithinInventionBudget(text, sourceText, what, raw);
   };
 
   for (const solution of output.existing_solutions) {
@@ -211,13 +269,17 @@ function assertGapAnalysisSound(
   for (const gap of output.unresolved_gaps) {
     ground(gap.explanation, gap.evidence_indices, `gap "${gap.gap}"`);
   }
+  // Addressed aspects summarize across solutions, so allow grounding
+  // against the union of all cited items. Every ungrounded entry is
+  // named in the error so a retry can fix all of them at once
+  // (same style as the per-solution/per-gap errors above).
+  const anySourceText = items.map((entry) => `${entry.item.title} ${entry.item.snippet}`).join(" ");
+  const ungroundedAspects = output.addressed_aspects.filter((aspect) => !isGrounded(aspect, anySourceText));
+  if (ungroundedAspects.length > 0) {
+    throw new GapAnalysisParseError(`addressed_aspects entries are not semantically grounded in the cited evidence: ${ungroundedAspects.map((aspect) => `"${aspect}"`).join(", ")}.`, raw);
+  }
   for (const aspect of output.addressed_aspects) {
-    // Addressed aspects summarize across solutions, so allow grounding
-    // against the union of all cited items.
-    const anySourceText = items.map((entry) => `${entry.item.title} ${entry.item.snippet}`).join(" ");
-    if (!isGrounded(aspect, anySourceText)) {
-      throw new GapAnalysisParseError(`addressed_aspects entry is not semantically grounded in the cited evidence.`, raw);
-    }
+    assertWithinInventionBudget(aspect, anySourceText, "addressed_aspects entry", raw);
   }
   if (ABSOLUTE_NO_SOLUTION.test(JSON.stringify(output))) {
     throw new GapAnalysisParseError("Output claims that no solution exists — search results cannot establish that.", raw);
@@ -312,11 +374,19 @@ async function analyzeCandidate(problem: CandidateProblem, getProvider: () => LL
   }
 
   const provider = getProvider();
+
+  // Validation feedback from the previous attempt, fed back into the
+  // next prompt so a retry corrects the specific rejected field
+  // instead of regenerating blindly — the same mechanism the
+  // Evidence Analyzer uses. `withRetry` itself is unchanged — it
+  // already surfaces the error through `onRetry`.
+  let lastFailure: string | null = null;
+
   const output = await withRetry(
     async (attemptNumber) => {
       const raw = await provider.generateJSON({
         system: "You are ProblemRadar's Gap Analyzer. Identify existing solutions and evidence-supported gaps for the given problem using ONLY the numbered search results provided. Never invent facts, statistics, populations, or solutions, and never claim no solution exists. Output only valid JSON.",
-        prompt: buildPrompt(problem, items),
+        prompt: buildPrompt(problem, items, lastFailure),
         temperature: 0.1,
       });
       console.log(`[ProblemRadar/GapAnalysis] candidate="${problem.id}" attempt ${attemptNumber}/${MAX_ATTEMPTS} — raw model output:\n${raw}`);
@@ -336,7 +406,10 @@ async function analyzeCandidate(problem: CandidateProblem, getProvider: () => LL
     {
       maxAttempts: MAX_ATTEMPTS,
       isRetryable: (error) => error instanceof GapAnalysisParseError,
-      onRetry: (attemptNumber, error) => console.warn(`[ProblemRadar/GapAnalysis] candidate="${problem.id}" attempt ${attemptNumber}/${MAX_ATTEMPTS} failed validation; retrying: ${error instanceof Error ? error.message : String(error)}`),
+      onRetry: (attemptNumber, error) => {
+        lastFailure = error instanceof Error ? error.message : String(error);
+        console.warn(`[ProblemRadar/GapAnalysis] candidate="${problem.id}" attempt ${attemptNumber}/${MAX_ATTEMPTS} failed validation; retrying: ${lastFailure}`);
+      },
     }
   );
 

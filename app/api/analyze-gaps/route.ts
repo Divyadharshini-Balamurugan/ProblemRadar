@@ -14,6 +14,11 @@ const EvidenceRefSchema = z.object({
   evidence_summary: z.string(),
 });
 
+const CandidateObservationSchema = z.object({
+  claim: z.string().min(3),
+  evidence_indices: z.array(z.number().int().positive()),
+});
+
 const CandidateProblemSchema = z.object({
   id: z.string().min(1),
   hypothesis_id: z.string().min(1),
@@ -25,6 +30,10 @@ const CandidateProblemSchema = z.object({
   observed_impact: z.string().min(1),
   evidence_refs: z.array(EvidenceRefSchema),
   evidence_strength: z.enum(["strong", "moderate"]),
+  // Validated Phase 3 observations — the Gap Analyzer anchors its
+  // research and queries on them, so they must survive request
+  // validation (zod strips keys a schema doesn't declare).
+  observations: z.array(CandidateObservationSchema).optional(),
 });
 
 const RequestSchema = z.object({ problems: z.array(CandidateProblemSchema) });

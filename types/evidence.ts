@@ -38,6 +38,32 @@ export type EvidenceRecency = (typeof EVIDENCE_RECENCY_LEVELS)[number];
  * paraphrased by the model — so every entry stays traceable back to the
  * exact retrieved source and the query that found it.
  */
+/**
+ * One structured, evidence-backed observation extracted from a single
+ * source. Every non-null field must be directly supported by that source's
+ * own title/snippet — the analyzer validates this deterministically (see
+ * `lib/llm/evidence-analyzer.ts`). Optional fields stay null when the source
+ * doesn't establish them; nothing is invented to fill the shape.
+ */
+export interface EvidenceObservation {
+  /** The factual observation this source supports (paraphrase or quote). */
+  observation: string;
+  /** Who is affected, if the source establishes it. */
+  affected_group: string | null;
+  /** What the affected people/organizations are trying to do, if stated. */
+  activity: string | null;
+  /** The concrete friction/difficulty/barrier, if stated. */
+  friction: string | null;
+  /** A workaround people use, if the source documents one. */
+  workaround: string | null;
+  /** An existing solution/service/program mentioned, if any. */
+  existing_solution: string | null;
+  /** A signal that something remains unresolved, if the source shows one. */
+  unresolved_signal: string | null;
+  /** 1-based index of the source within its hypothesis's evidence list. */
+  source_index: number;
+}
+
 export interface SourceEvidence {
   hypothesis_id: string;
   /** The source's original URL, exactly as it appears in the SearchRun's `results`. */
@@ -57,6 +83,12 @@ export interface SourceEvidence {
    * `lib/llm/evidence-analyzer.ts`).
    */
   evidence_summary: string;
+  /**
+   * Structured observations extracted from this source (Phase 2). Optional:
+   * entries without useful observation content simply omit it. Every
+   * observation stays traceable to this source via `source_index`.
+   */
+  observations?: EvidenceObservation[];
 }
 
 /** Why a hypothesis has no `SourceEvidence` entries, or why analysis wasn't attempted/completed for it. */
