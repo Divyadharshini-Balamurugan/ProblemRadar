@@ -9,7 +9,7 @@
     "lint": "eslint",
     "test:problem-generator": "tsc --project tests/tsconfig.json && node --test .test-out/tests/problem-generator.test.js",
     "test:gap-analysis": "tsc --project tests/tsconfig.json && node --test .test-out/tests/gap-analysis.test.js",
-    "test": "tsc --project tests/tsconfig.json && node --test .test-out/tests/problem-generator.test.js .test-out/tests/gap-analysis.test.js .test-out/tests/search-orchestrator.test.js .test-out/tests/evidence-analyzer.test.js .test-out/tests/problem-ranker.test.js"
+    "test": "tsc --project tests/tsconfig.json && node --test .test-out/tests/problem-generator.test.js .test-out/tests/gap-analysis.test.js .test-out/tests/search-orchestrator.test.js .test-out/tests/evidence-analyzer.test.js .test-out/tests/problem-ranker.test.js .test-out/tests/final-result.test.js"
   },
   "dependencies": {
     "@radix-ui/react-progress": "^1.1.16",

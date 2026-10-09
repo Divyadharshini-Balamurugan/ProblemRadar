@@ -1,35 +1,86 @@
-import type { EvidenceAnalysisRun, IntentScope, ProblemGenerationResult, ResearchPlan, SearchRun } from "@/types";
+import type {
+  EvidenceAnalysisRun,
+  GapAnalysisResult,
+  IntentScope,
+  ProblemGenerationResult,
+  ProblemRankingResult,
+  ResearchPlan,
+  SearchRun,
+} from "@/types";
 
 /**
- * Hands the completed Stage 1 → 2 → 3 → 4 pipeline result from the
- * workspace page (`/`, where all four stages actually run — see
- * `app/page.tsx`) across a client-side route change to `/results`,
- * without re-fetching or re-deriving anything there.
+ * Registry of completed pipeline runs, keyed by run id.
  *
- * This is deliberately NOT a state-management library or a React context
- * — just a plain module-level value with a getter/setter, the smallest
- * thing that can survive a route change within the same browser tab.
- * (Next.js App Router client-side navigation keeps the JS module registry
- * alive; only a full page reload resets it, at which point both server
- * and client render from `null` consistently, so there's no hydration
- * mismatch risk.) There's still no database or persistence layer — this
- * intentionally does not survive a reload, matching the rest of the app.
+ * The research page generates a run id (`crypto.randomUUID()`) when a
+ * pipeline starts, executes the real stages, saves the completed run
+ * here, and navigates to `/results?...&run=<runId>`. The results page
+ * loads the run by that id, so the URL — not component-tree memory —
+ * identifies what to render.
+ *
+ * Runs are kept in memory for fast route transitions and mirrored to
+ * sessionStorage so a completed run survives refreshes in the same tab.
  */
 export interface PipelineResult {
+  /** Stable id for this run — generated when the pipeline starts. */
+  runId: string;
   query: string;
   intent: IntentScope;
   plan: ResearchPlan;
   searchRun: SearchRun;
   analysis: EvidenceAnalysisRun;
   problemGeneration: ProblemGenerationResult;
+  gapAnalysis: GapAnalysisResult;
+  ranking: ProblemRankingResult;
 }
 
-let latestPipelineResult: PipelineResult | null = null;
+const runs = new Map<string, PipelineResult>();
+const STORAGE_PREFIX = "problem-radar:run:";
 
-export function setPipelineResult(result: PipelineResult): void {
-  latestPipelineResult = result;
+export function saveRun(result: PipelineResult): void {
+  runs.set(result.runId, result);
+  if (typeof window === "undefined") return;
+
+  try {
+    window.sessionStorage.setItem(
+      `${STORAGE_PREFIX}${result.runId}`,
+      JSON.stringify(result)
+    );
+  } catch (error) {
+    // Keep navigation functional if storage is blocked or the tab is out of space.
+    console.warn("[ProblemRadar] Could not save the run to session storage.", error);
+  }
 }
 
-export function getPipelineResult(): PipelineResult | null {
-  return latestPipelineResult;
+export function getRun(runId: string): PipelineResult | null {
+  const inMemory = runs.get(runId);
+  if (inMemory) return inMemory;
+  if (typeof window === "undefined") return null;
+
+  try {
+    const serialized = window.sessionStorage.getItem(`${STORAGE_PREFIX}${runId}`);
+    if (!serialized) return null;
+    const result = JSON.parse(serialized) as PipelineResult;
+    if (result.runId !== runId) return null;
+    runs.set(runId, result);
+    return result;
+  } catch (error) {
+    console.warn("[ProblemRadar] Could not restore the run from session storage.", error);
+    return null;
+  }
+}
+
+export function clearRuns(): void {
+  runs.clear();
+  if (typeof window === "undefined") return;
+
+  try {
+    const keysToRemove: string[] = [];
+    for (let index = 0; index < window.sessionStorage.length; index += 1) {
+      const key = window.sessionStorage.key(index);
+      if (key?.startsWith(STORAGE_PREFIX)) keysToRemove.push(key);
+    }
+    keysToRemove.forEach((key) => window.sessionStorage.removeItem(key));
+  } catch (error) {
+    console.warn("[ProblemRadar] Could not clear saved runs from session storage.", error);
+  }
 }
